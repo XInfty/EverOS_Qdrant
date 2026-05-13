@@ -24,7 +24,11 @@ from qdrant_client.http import models as qmodels
 from core.di.decorators import repository
 from core.observation.logger import get_logger
 from core.oxm.constants import MAGIC_ALL
-from core.oxm.qdrant.base_repository import BaseQdrantRepository, to_epoch_ms
+from core.oxm.qdrant.base_repository import (
+    BaseQdrantRepository,
+    compute_effective_threshold,
+    to_epoch_ms,
+)
 from infra_layer.adapters.out.search.qdrant.memory.foresight_collection import (
     ForesightCollection,
 )
@@ -223,10 +227,10 @@ class ForesightQdrantRepository(BaseQdrantRepository[ForesightCollection]):
 
             query_filter = qmodels.Filter(must=conditions) if conditions else None
             ef_value = max(128, limit * 2)
-            if radius is not None and radius > -1.0:
-                effective_threshold = min(radius, score_threshold)
-            else:
-                effective_threshold = score_threshold
+            # Two-stage gating — see ``compute_effective_threshold``.
+            effective_threshold = compute_effective_threshold(
+                radius, score_threshold
+            )
 
             scored_points = await self.search(
                 query_vector=query_vector,
@@ -234,9 +238,7 @@ class ForesightQdrantRepository(BaseQdrantRepository[ForesightCollection]):
                 query_filter=query_filter,
                 with_payload=True,
                 with_vectors=False,
-                score_threshold=(
-                    effective_threshold if effective_threshold > 0 else None
-                ),
+                score_threshold=effective_threshold,
                 search_params=qmodels.SearchParams(hnsw_ef=ef_value),
             )
 

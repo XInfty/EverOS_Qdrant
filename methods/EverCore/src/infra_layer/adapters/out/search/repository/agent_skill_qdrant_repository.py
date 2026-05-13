@@ -18,7 +18,10 @@ from qdrant_client.http import models as qmodels
 from core.di.decorators import repository
 from core.observation.logger import get_logger
 from core.oxm.constants import MAGIC_ALL
-from core.oxm.qdrant.base_repository import BaseQdrantRepository
+from core.oxm.qdrant.base_repository import (
+    BaseQdrantRepository,
+    compute_effective_threshold,
+)
 from infra_layer.adapters.out.search.qdrant.memory.agent_skill_collection import (
     AgentSkillCollection,
 )
@@ -122,19 +125,14 @@ class AgentSkillQdrantRepository(BaseQdrantRepository[AgentSkillCollection]):
             query_filter = qmodels.Filter(must=conditions) if conditions else None
 
             ef_value = max(128, limit * 2)
-            # Two-stage score gating (parity with the agent_case repository):
-            #   - ``effective_threshold`` is the wider net we pass to Qdrant
-            #     server-side via ``score_threshold``. With both ``radius`` and
-            #     ``score_threshold`` set, we use the *more permissive* (lower)
-            #     of the two so recall is not silently narrowed by either.
-            #   - The client-side ``point.score < score_threshold`` post-filter
-            #     enforces the hard caller-facing minimum. This lets a caller
-            #     widen the recall via ``radius`` while still requiring a
-            #     stricter cut-off in the returned list.
-            if radius is not None and radius > -1.0:
-                effective_threshold = min(radius, score_threshold)
-            else:
-                effective_threshold = score_threshold
+            # Two-stage gating: ``compute_effective_threshold`` returns the
+            # more permissive (smaller) positive bound of ``radius`` and
+            # ``score_threshold``, or ``None`` if neither is positive. The
+            # client-side ``point.score < score_threshold`` post-filter below
+            # still enforces the caller's hard cut-off.
+            effective_threshold = compute_effective_threshold(
+                radius, score_threshold
+            )
 
             scored_points = await self.search(
                 query_vector=query_vector,
@@ -142,9 +140,7 @@ class AgentSkillQdrantRepository(BaseQdrantRepository[AgentSkillCollection]):
                 query_filter=query_filter,
                 with_payload=True,
                 with_vectors=False,
-                score_threshold=(
-                    effective_threshold if effective_threshold > 0 else None
-                ),
+                score_threshold=effective_threshold,
                 search_params=qmodels.SearchParams(hnsw_ef=ef_value),
             )
 

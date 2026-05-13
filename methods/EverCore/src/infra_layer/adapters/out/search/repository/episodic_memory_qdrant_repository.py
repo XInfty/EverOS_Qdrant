@@ -21,7 +21,11 @@ from qdrant_client.http import models as qmodels
 from core.di.decorators import repository
 from core.observation.logger import get_logger
 from core.oxm.constants import MAGIC_ALL
-from core.oxm.qdrant.base_repository import BaseQdrantRepository, to_epoch_ms
+from core.oxm.qdrant.base_repository import (
+    BaseQdrantRepository,
+    compute_effective_threshold,
+    to_epoch_ms,
+)
 from infra_layer.adapters.out.search.qdrant.memory.episodic_memory_collection import (
     EpisodicMemoryCollection,
 )
@@ -200,10 +204,14 @@ class EpisodicMemoryQdrantRepository(BaseQdrantRepository[EpisodicMemoryCollecti
             # This way callers can use ``radius`` to widen recall without
             # accidentally making the server-side cut stricter than the
             # caller's own cut-off.
-            if radius is not None and radius > -1.0:
-                effective_threshold = min(radius, score_threshold)
-            else:
-                effective_threshold = score_threshold
+            # Two-stage gating — see ``compute_effective_threshold`` for the
+            # precedence rules. The plain ``min(radius, score_threshold)``
+            # collapsed to ``0`` whenever ``score_threshold`` was at its
+            # default and silently disabled both server- and client-side
+            # filtering.
+            effective_threshold = compute_effective_threshold(
+                radius, score_threshold
+            )
 
             scored_points = await self.search(
                 query_vector=query_vector,
@@ -211,9 +219,7 @@ class EpisodicMemoryQdrantRepository(BaseQdrantRepository[EpisodicMemoryCollecti
                 query_filter=query_filter,
                 with_payload=True,
                 with_vectors=False,
-                score_threshold=(
-                    effective_threshold if effective_threshold > 0 else None
-                ),
+                score_threshold=effective_threshold,
                 search_params=qmodels.SearchParams(hnsw_ef=ef_value),
             )
 

@@ -8,7 +8,7 @@ config from environment / ``.env`` (loaded via python-dotenv if present):
     OPENROUTER_API_KEY        # required
     OPENROUTER_BASE_URL       # default: https://openrouter.ai/api/v1
     VECTORIZE_MODEL           # default: qwen/qwen3-embedding-8b
-    VECTORIZE_DIMENSIONS      # default: 4096
+    VECTORIZE_DIMENSIONS      # default: 1024 (matches memory_layer/constants.py)
     MONGO_URI                 # default: mongodb://localhost:27017
     QDRANT_HOST               # default: localhost
     QDRANT_PORT               # default: 6333
@@ -107,7 +107,13 @@ class Config:
             vectorize_model=os.environ.get(
                 "VECTORIZE_MODEL", "qwen/qwen3-embedding-8b"
             ),
-            vectorize_dimensions=int(os.environ.get("VECTORIZE_DIMENSIONS", "4096")),
+            # Default mirrors ``memory_layer/constants.py`` (1024) so a migration
+            # run with no ``VECTORIZE_DIMENSIONS`` env produces collections that
+            # are immediately usable by the runtime service. Sites running a
+            # different dimension (e.g. 4096) MUST set the env var in both
+            # places (migration + runtime) — a default mismatch would silently
+            # produce dim-incompatible collections at cutover.
+            vectorize_dimensions=int(os.environ.get("VECTORIZE_DIMENSIONS", "1024")),
             mongo_uri=os.environ.get("MONGO_URI", "mongodb://localhost:27017"),
             qdrant_host=os.environ.get("QDRANT_HOST", "localhost"),
             qdrant_port=int(os.environ.get("QDRANT_PORT", "6333")),
@@ -271,11 +277,16 @@ def migrate(
     )
 
     mongo = MongoClient(config.mongo_uri)
+    # Pre-initialize both clients to ``None`` so the ``finally`` block can
+    # safely call ``.close()`` even if construction of ``qdrant`` or ``openai``
+    # raises mid-setup. Previously a failing ``QdrantClient(...)`` left
+    # ``openai`` unbound and the finally-cleanup raised ``NameError``,
+    # masking the original connection error.
     qdrant: Optional[QdrantClient] = None
+    openai: Optional[OpenAI] = None
+    cursor = None
     try:
         qdrant = QdrantClient(host=config.qdrant_host, port=config.qdrant_port)
-        # OpenAI client owns an httpx pool that's closed on GC; explicit close
-        # is best-effort below via the openai_client.close() call in finally.
         openai = OpenAI(
             api_key=config.openrouter_api_key,
             base_url=config.openrouter_base_url,
@@ -288,7 +299,11 @@ def migrate(
         if not dry_run:
             ensure_qdrant_collection(qdrant, qdrant_coll, config.vectorize_dimensions)
 
-        cursor = coll.find()
+        # ``no_cursor_timeout=True``: a slow embedding batch (OpenRouter
+        # rate-limit, retry) can easily exceed the server-side default cursor
+        # idle timeout (10 min), which would surface as ``CursorNotFound``
+        # mid-sweep with no progress signal. The cursor is closed in finally.
+        cursor = coll.find(no_cursor_timeout=True)
         if limit:
             cursor = cursor.limit(limit)
 
@@ -398,12 +413,19 @@ def migrate(
             time.time() - started,
         )
     finally:
-        # Close connections in reverse construction order. Best-effort: a
-        # failing close should not mask a real exception from the body.
+        # Close in reverse construction order. Best-effort cleanup: a failing
+        # close should not mask a real exception from the body. Each handle is
+        # tested for ``None`` because construction may have raised mid-setup.
         try:
-            close_fn = getattr(openai, "close", None)
-            if callable(close_fn):
-                close_fn()
+            if cursor is not None:
+                cursor.close()
+        except Exception:  # noqa: BLE001
+            logger.debug("cursor.close() raised; ignoring during cleanup", exc_info=True)
+        try:
+            if openai is not None:
+                close_fn = getattr(openai, "close", None)
+                if callable(close_fn):
+                    close_fn()
         except Exception:  # noqa: BLE001
             logger.debug("openai.close() raised; ignoring during cleanup", exc_info=True)
         try:

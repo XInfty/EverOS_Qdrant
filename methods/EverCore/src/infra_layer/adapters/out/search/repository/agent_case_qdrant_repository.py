@@ -17,7 +17,11 @@ from qdrant_client.http import models as qmodels
 from core.di.decorators import repository
 from core.observation.logger import get_logger
 from core.oxm.constants import MAGIC_ALL
-from core.oxm.qdrant.base_repository import BaseQdrantRepository, to_epoch_s
+from core.oxm.qdrant.base_repository import (
+    BaseQdrantRepository,
+    compute_effective_threshold,
+    to_epoch_s,
+)
 from infra_layer.adapters.out.search.qdrant.memory.agent_case_collection import (
     AgentCaseCollection,
 )
@@ -100,13 +104,13 @@ class AgentCaseQdrantRepository(BaseQdrantRepository[AgentCaseCollection]):
 
             query_filter = qmodels.Filter(must=conditions) if conditions else None
             ef_value = max(128, limit * 2)
-            # Two-stage gating: use the more permissive (lower) of ``radius``
-            # and ``score_threshold`` server-side, enforce the hard caller cut
-            # client-side. See episodic_memory repo for the full rationale.
-            if radius is not None and radius > -1.0:
-                effective_threshold = min(radius, score_threshold)
-            else:
-                effective_threshold = score_threshold
+            # Two-stage gating: use the more permissive (lower) positive
+            # bound of ``radius`` and ``score_threshold`` server-side, then
+            # enforce the hard caller cut client-side. See
+            # ``compute_effective_threshold`` for the precedence rules.
+            effective_threshold = compute_effective_threshold(
+                radius, score_threshold
+            )
 
             scored_points = await self.search(
                 query_vector=query_vector,
@@ -114,9 +118,7 @@ class AgentCaseQdrantRepository(BaseQdrantRepository[AgentCaseCollection]):
                 query_filter=query_filter,
                 with_payload=True,
                 with_vectors=False,
-                score_threshold=(
-                    effective_threshold if effective_threshold > 0 else None
-                ),
+                score_threshold=effective_threshold,
                 search_params=qmodels.SearchParams(hnsw_ef=ef_value),
             )
 

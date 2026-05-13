@@ -46,8 +46,48 @@ def mongo_id_to_qdrant_id(mongo_id: Any) -> str:
 
     The mapping is one-way (idempotent), so callers that need the Mongo
     original keep it in the payload (e.g. as ``parent_id``).
+
+    Raises:
+        ValueError: when ``mongo_id`` is ``None`` or an empty string. Both
+            would map to the same fixed Qdrant id and silently collide with
+            real records — usually a sign of an upstream bug.
     """
+    if mongo_id is None or (isinstance(mongo_id, str) and not mongo_id):
+        raise ValueError(
+            "mongo_id_to_qdrant_id requires a non-empty source id; got "
+            f"{mongo_id!r}"
+        )
     return str(uuid.uuid5(_MONGO_TO_QDRANT_NS, str(mongo_id)))
+
+
+def compute_effective_threshold(
+    radius: Optional[float], score_threshold: float
+) -> Optional[float]:
+    """
+    Two-stage gating: pick the *more permissive* (smaller) positive bound to
+    pass to Qdrant server-side. Returns ``None`` when neither bound is
+    positive — caller passes that ``None`` to skip server-side filtering and
+    relies on the client-side ``point.score < score_threshold`` post-filter.
+
+    Semantics:
+        - ``score_threshold = 0.0`` is the parameter default and means
+          "no minimum"; treated as unset.
+        - ``radius is None`` or ``radius <= -1.0`` means "no radius
+          expansion"; treated as unset.
+        - With both set positive, return the smaller value so server-side
+          recall is the wider net (and the hard caller-facing cut-off is
+          still enforced client-side).
+
+    Without this helper, a literal ``min(radius, score_threshold)`` with a
+    default ``score_threshold=0.0`` evaluates to ``0.0`` and silently
+    disables both server-side and client-side filtering.
+    """
+    candidates: List[float] = []
+    if radius is not None and radius > 0:
+        candidates.append(radius)
+    if score_threshold > 0:
+        candidates.append(score_threshold)
+    return min(candidates) if candidates else None
 
 
 def to_epoch_ms(dt: datetime) -> int:
