@@ -137,9 +137,8 @@ class ForesightQdrantConverter(BaseQdrantConverter[ForesightCollection]):
             )
 
         except Exception as e:
-            logger.error(
-                "Failed to convert MongoDB foresight document to Qdrant point: %s",
-                e,
+            logger.exception(
+                "Failed to convert MongoDB foresight document to Qdrant point: %s", e
             )
             raise
 

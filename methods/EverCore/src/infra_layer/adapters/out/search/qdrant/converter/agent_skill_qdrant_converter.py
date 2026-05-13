@@ -81,7 +81,7 @@ class AgentSkillQdrantConverter(BaseQdrantConverter[AgentSkillCollection]):
             )
 
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Failed to convert AgentSkillRecord to Qdrant point: %s", e
             )
             raise

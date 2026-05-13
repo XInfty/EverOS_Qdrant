@@ -122,17 +122,19 @@ class AgentSkillQdrantRepository(BaseQdrantRepository[AgentSkillCollection]):
             query_filter = qmodels.Filter(must=conditions) if conditions else None
 
             ef_value = max(128, limit * 2)
-            # Two-stage score gating (parity with Milvus repository):
+            # Two-stage score gating (parity with the agent_case repository):
             #   - ``effective_threshold`` is the wider net we pass to Qdrant
-            #     server-side via ``score_threshold`` (uses ``radius`` if it
-            #     was explicitly set, otherwise ``score_threshold``).
+            #     server-side via ``score_threshold``. With both ``radius`` and
+            #     ``score_threshold`` set, we use the *more permissive* (lower)
+            #     of the two so recall is not silently narrowed by either.
             #   - The client-side ``point.score < score_threshold`` post-filter
             #     enforces the hard caller-facing minimum. This lets a caller
             #     widen the recall via ``radius`` while still requiring a
             #     stricter cut-off in the returned list.
-            effective_threshold = (
-                radius if (radius is not None and radius > -1.0) else score_threshold
-            )
+            if radius is not None and radius > -1.0:
+                effective_threshold = min(radius, score_threshold)
+            else:
+                effective_threshold = score_threshold
 
             scored_points = await self.search(
                 query_vector=query_vector,
@@ -168,7 +170,7 @@ class AgentSkillQdrantRepository(BaseQdrantRepository[AgentSkillCollection]):
             return search_results
 
         except Exception as e:
-            logger.error("AgentSkill Qdrant search failed: %s", e)
+            logger.exception("AgentSkill Qdrant search failed: %s", e)
             raise
 
     # -------------------------------------------------------- domain deletes
@@ -229,7 +231,7 @@ class AgentSkillQdrantRepository(BaseQdrantRepository[AgentSkillCollection]):
             return count
 
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Failed to delete Qdrant points for cluster=%s: %s", cluster_id, e
             )
             # Re-raise so callers can distinguish a genuine zero from an

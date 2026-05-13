@@ -162,9 +162,7 @@ class UserProfileQdrantConverter(BaseQdrantConverter[UserProfileCollection]):
             return items
 
         except Exception as e:
-            logger.error(
-                "Failed to convert MongoDB UserProfile to Qdrant items: %s",
-                e,
-                exc_info=True,
+            logger.exception(
+                "Failed to convert MongoDB UserProfile to Qdrant items: %s", e
             )
             raise

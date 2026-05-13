@@ -89,10 +89,8 @@ class AtomicFactQdrantConverter(BaseQdrantConverter[AtomicFactCollection]):
             )
 
         except Exception as e:
-            logger.error(
-                "Failed to convert MongoDB AtomicFact to Qdrant point: %s",
-                e,
-                exc_info=True,
+            logger.exception(
+                "Failed to convert MongoDB AtomicFact to Qdrant point: %s", e
             )
             raise
 

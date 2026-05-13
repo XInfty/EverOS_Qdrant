@@ -219,6 +219,10 @@ class AtomicFactQdrantRepository(BaseQdrantRepository[AtomicFactCollection]):
                         "group_id": payload.get("group_id"),
                         "session_id": payload.get("session_id"),
                         "participants": payload.get("participants"),
+                        # Returned alongside ``search_content`` (and matching
+                        # the batch path) so callers don't need a Mongo
+                        # round-trip to recover the canonical atomic fact text.
+                        "atomic_fact": payload.get("atomic_fact"),
                         # Convert epoch milliseconds back to UTC datetime so
                         # callers get a consistent type across all repository
                         # entry points (parity with create_and_save_atomic_fact

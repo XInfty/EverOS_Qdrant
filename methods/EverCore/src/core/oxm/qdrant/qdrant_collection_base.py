@@ -31,6 +31,10 @@ from typing import Any, ClassVar, Dict, List, Optional
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
+from qdrant_client.http.exceptions import (
+    ResponseHandlingException,
+    UnexpectedResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -179,10 +183,19 @@ class QdrantCollectionBase:
     # ------------------------------------------------------------------ schema
 
     def exists(self) -> bool:
-        """Return True if the underlying Qdrant collection already exists."""
+        """
+        Return True if the underlying Qdrant collection already exists.
+
+        Only the known qdrant-client transport-level exceptions are caught
+        (``ResponseHandlingException`` for connection/timeout errors,
+        ``UnexpectedResponse`` for 4xx/5xx HTTP responses). Anything else —
+        including configuration errors, auth failures surfaced as different
+        exception types, or programming bugs — is allowed to propagate so
+        infrastructure problems stay visible.
+        """
         try:
             return self.client().collection_exists(self.name)
-        except Exception as e:  # noqa: BLE001
+        except (ResponseHandlingException, UnexpectedResponse) as e:
             logger.warning(
                 "collection_exists('%s') failed: %s — treating as non-existent",
                 self.name,

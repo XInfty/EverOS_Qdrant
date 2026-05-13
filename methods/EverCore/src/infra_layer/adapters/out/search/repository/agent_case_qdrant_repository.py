@@ -150,5 +150,5 @@ class AgentCaseQdrantRepository(BaseQdrantRepository[AgentCaseCollection]):
             return search_results
 
         except Exception as e:
-            logger.error("AgentCase Qdrant search failed: %s", e)
+            logger.exception("AgentCase Qdrant search failed: %s", e)
             raise

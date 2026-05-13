@@ -63,7 +63,17 @@ class EpisodicMemoryQdrantRepository(BaseQdrantRepository[EpisodicMemoryCollecti
             A small summary dict (id, user_id, timestamp, episode,
             search_content) — same shape as the Milvus repository to keep
             callers untouched at cutover.
+
+        Raises:
+            ValueError: when ``vector`` is None or empty. A missing embedding
+                would only surface as a confusing 400 from Qdrant at upsert
+                time, far from the bad caller. Fail fast instead.
         """
+        if vector is None or len(vector) == 0:
+            raise ValueError(
+                f"Vector is required for EpisodicMemory {id} but was not populated"
+            )
+
         try:
             payload = {
                 "user_id": user_id or "",
@@ -121,11 +131,16 @@ class EpisodicMemoryQdrantRepository(BaseQdrantRepository[EpisodicMemoryCollecti
         try:
             conditions: List[qmodels.FieldCondition] = []
 
-            if user_id != MAGIC_ALL:
+            # Guard both ``None`` (no scope passed) and the explicit "all"
+            # sentinel. Without the ``is not None`` guard a default ``user_id=None``
+            # slipped past the sentinel check and the ``user_id or ""`` fallback
+            # filtered the search to documents with an empty ``user_id`` payload,
+            # i.e. zero hits in practice.
+            if user_id is not None and user_id != MAGIC_ALL:
                 conditions.append(
                     qmodels.FieldCondition(
                         key="user_id",
-                        match=qmodels.MatchValue(value=user_id or ""),
+                        match=qmodels.MatchValue(value=user_id),
                     )
                 )
 
