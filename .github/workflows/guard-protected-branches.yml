@@ -1,0 +1,55 @@
+name: Guard Protected Branches
+
+# Detects direct pushes to long-lived branches that did not come from a PR merge.
+# Since GitHub Free does not allow Branch Protection on private repos, this
+# acts as a post-hoc alert instead of a hard block. DerAuctor is allowed to
+# bypass the guard (admin override).
+
+on:
+  push:
+    branches:
+      - main
+      - prod
+      - prod_node1
+      - prod_bootstrap
+
+jobs:
+  verify-pr-merge:
+    runs-on: ubuntu-latest
+    # DerAuctor bypass — admin override per project policy.
+    if: github.actor != 'DerAuctor'
+    steps:
+      - name: Inspect head commit
+        env:
+          MSG: ${{ github.event.head_commit.message }}
+          ACTOR: ${{ github.actor }}
+          PUSHER: ${{ github.event.pusher.name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.event.head_commit.id }}
+          FORCED: ${{ github.event.forced }}
+          CREATED: ${{ github.event.created }}
+        run: |
+          set -e
+          # Allow branch creation events (initial push).
+          if [ "$CREATED" = "true" ]; then
+            echo "::notice::Branch creation event, allowed."
+            exit 0
+          fi
+
+          # Allow squash-merge / merge-commit / rebase from PR.
+          # GitHub's squash merge writes commit titles like "feat: ... (#123)".
+          # Standard merge commits start with "Merge pull request #N".
+          if echo "$MSG" | grep -qE '(^Merge pull request #[0-9]+)|(\(#[0-9]+\)$)|(\(#[0-9]+\)\n)'; then
+            echo "::notice::PR merge detected on $REF by $ACTOR ($SHA). Allowed."
+            exit 0
+          fi
+
+          # Otherwise this is a direct push to a protected branch by a non-bypass actor.
+          echo "::error::Direct push to protected branch $REF by $ACTOR."
+          echo "::error::Pusher: $PUSHER  SHA: $SHA  Forced: $FORCED"
+          echo "::error::Commit message: $MSG"
+          echo ""
+          echo "Protected branches require PR + review. Bypass is reserved for DerAuctor."
+          echo "If this push was intentional, push as DerAuctor; otherwise revert with:"
+          echo "  git revert $SHA && git push"
+          exit 1
