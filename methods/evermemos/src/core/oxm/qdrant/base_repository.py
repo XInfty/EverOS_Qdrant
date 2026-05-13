@@ -14,6 +14,7 @@ so we keep the same async repository surface as the Milvus counterpart.
 """
 
 import asyncio
+import uuid
 from abc import ABC
 from datetime import datetime, timezone
 from typing import Any, Generic, List, Optional, Type, TypeVar
@@ -26,6 +27,27 @@ from core.oxm.qdrant.qdrant_collection_base import QdrantCollectionBase
 logger = get_logger(__name__)
 
 T = TypeVar("T", bound=QdrantCollectionBase)
+
+
+# Stable namespace for Mongo ObjectId -> Qdrant UUID translation.
+# Qdrant point ids accept only unsigned integers or RFC-4122 UUIDs;
+# Mongo ObjectIds (24 hex chars) are neither. Mapping is via ``uuid5``
+# (SHA-1, deterministic) so the same Mongo id always maps to the same
+# Qdrant point id — required for idempotent re-embed + lookup by Mongo
+# back-reference. NEVER change this namespace without a full data-side
+# remigration.
+_MONGO_TO_QDRANT_NS = uuid.UUID("ec57c0e3-5e90-4d4a-9c1c-a8b9c7d8e7d6")
+
+
+def mongo_id_to_qdrant_id(mongo_id: Any) -> str:
+    """
+    Deterministic UUID5 mapping of any Mongo doc id (ObjectId/str/int) to a
+    Qdrant-compatible point id string.
+
+    The mapping is one-way (idempotent), so callers that need the Mongo
+    original keep it in the payload (e.g. as ``parent_id``).
+    """
+    return str(uuid.uuid5(_MONGO_TO_QDRANT_NS, str(mongo_id)))
 
 
 def to_epoch_ms(dt: datetime) -> int:
