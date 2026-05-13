@@ -1,5 +1,6 @@
 """
-Qdrant Collection Base — Stub fuer Phase 1 der Milvus->Qdrant-Migration.
+Qdrant Collection Base — vollstaendige Basisklasse fuer Qdrant-basierte
+Collections.
 
 Konzept-Mapping (laut qdrant.tech/documentation/migrate-to-qdrant/from-milvus):
 
@@ -8,117 +9,339 @@ Konzept-Mapping (laut qdrant.tech/documentation/migrate-to-qdrant/from-milvus):
     Collection              Collection (1:1)
     FieldSchema(vector)     VectorParams(size, distance)
     FieldSchema(scalar)     Payload field (schema-flexible)
-    Index(HNSW, COSINE)     HnswConfig + Distance.COSINE
+    Index(HNSW, COSINE)     HnswConfigDiff + Distance.Cosine
     Partition               Payload-Field ODER separate Collection
     COSINE                  Cosine
     L2                      Euclid
     IP                      Dot
 
-Diese Klasse ist absichtlich minimal. Voll-Implementierung erfolgt in
-nachfolgenden Commits auf ``feature/qdrant-adapter``.
+Die Klasse ist absichtlich schlanker als ihr Milvus-Pendant: Qdrant kennt
+keinen Alias-Mechanismus, also entfaellt der ``Real-Name + Alias +
+Timestamp``-Indirektions-Layer. Schema-Migrationen erfolgen extern (neue
+Collection mit neuem Namen, Daten umlagern).
 
-Wichtig: alle Methoden hier sind so ausgelegt, dass sie ohne aktive
-qdrant-Verbindung importierbar sind — sodass das Modul auch geladen werden
-kann, wenn ``VECTOR_STORE_BACKEND != "qdrant"``.
+Bei ``VECTOR_STORE_BACKEND != qdrant`` wird das Modul zwar geladen (durch
+DI-Container-Scan), aber ``QdrantLifespanProvider`` initialisiert nichts —
+``ensure_all()`` und alle anderen Methoden werden gar nicht aufgerufen.
 """
 
-from typing import Any, ClassVar, List, Optional
+import logging
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, Dict, List, Optional
 
-from core.observation.logger import get_logger
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
+# Mapping: kanonischer Lower-Case-Name (EverOS-intern) -> Qdrant SDK Enum.
+# Bewusst ueber Strings, damit Collection-Klassen nicht direkt vom SDK abhaengen.
+_PAYLOAD_SCHEMA_TYPE_MAP: Dict[str, "qmodels.PayloadSchemaType"] = {
+    "keyword": qmodels.PayloadSchemaType.KEYWORD,
+    "integer": qmodels.PayloadSchemaType.INTEGER,
+    "float": qmodels.PayloadSchemaType.FLOAT,
+    "bool": qmodels.PayloadSchemaType.BOOL,
+    "geo": qmodels.PayloadSchemaType.GEO,
+    "text": qmodels.PayloadSchemaType.TEXT,
+    "datetime": qmodels.PayloadSchemaType.DATETIME,
+    "uuid": qmodels.PayloadSchemaType.UUID,
+}
+
+# Distance-Mapping zum Schutz vor SDK-Versions-Drift.
+_DISTANCE_MAP: Dict[str, "qmodels.Distance"] = {
+    "cosine": qmodels.Distance.COSINE,
+    "euclid": qmodels.Distance.EUCLID,
+    "dot": qmodels.Distance.DOT,
+    "manhattan": qmodels.Distance.MANHATTAN,
+}
+
+
+@dataclass
 class IndexConfig:
     """
-    Konfiguration fuer Qdrant-Vector-Index. Analog zu
-    ``core.oxm.milvus.milvus_collection_base.IndexConfig`` aber mit Qdrant-
-    nativen Feldern.
+    Konfiguration fuer den (Vektor-)Index einer Qdrant-Collection.
 
-    TODO Phase 1.2: ``hnsw_config`` (m, ef_construct, full_scan_threshold),
-    ``quantization_config`` (scalar/PQ/BQ), ``on_disk_payload``,
-    ``sparse_vectors_config``.
+    Args:
+        size: Vektor-Dimension (1024 fuer qwen3-embedding-Default).
+        distance: Distanz-Metrik (``cosine``, ``euclid``, ``dot``, ``manhattan``).
+        on_disk: Vektor-Daten auf Disk halten (mmapped) statt vollstaendig im
+                 RAM. Reduziert Memory-Footprint bei groesseren Datasets.
+        hnsw_m: HNSW Maximum-Edges-per-Node. Hoeher = bessere Recall, mehr RAM.
+        hnsw_ef_construct: HNSW Search-Width beim Bauen. Hoeher = bessere
+                           Recall, langsamerer Build.
+        payload_indexes: Map ``field_name -> schema_type``. ``schema_type``
+                         ist einer von ``_PAYLOAD_SCHEMA_TYPE_MAP`` (e.g.
+                         ``"keyword"`` fuer string-equality-Filter).
     """
 
-    def __init__(
-        self,
-        size: int = 1024,
-        distance: str = "Cosine",
-        on_disk: bool = False,
-        hnsw_m: int = 16,
-        hnsw_ef_construct: int = 100,
-    ) -> None:
-        self.size = size
-        self.distance = distance
-        self.on_disk = on_disk
-        self.hnsw_m = hnsw_m
-        self.hnsw_ef_construct = hnsw_ef_construct
+    size: int = 1024
+    distance: str = "cosine"
+    on_disk: bool = False
+    hnsw_m: int = 16
+    hnsw_ef_construct: int = 100
+    payload_indexes: Dict[str, str] = field(default_factory=dict)
+
+    def to_vectors_config(self) -> qmodels.VectorParams:
+        """Konvertiert in ``qdrant_client.http.models.VectorParams``."""
+        distance_key = self.distance.strip().lower()
+        if distance_key not in _DISTANCE_MAP:
+            raise ValueError(
+                f"Unknown distance '{self.distance}'. "
+                f"Supported: {sorted(_DISTANCE_MAP)}"
+            )
+        return qmodels.VectorParams(
+            size=self.size,
+            distance=_DISTANCE_MAP[distance_key],
+            on_disk=self.on_disk,
+            hnsw_config=qmodels.HnswConfigDiff(
+                m=self.hnsw_m,
+                ef_construct=self.hnsw_ef_construct,
+            ),
+        )
 
 
 class QdrantCollectionBase:
     """
-    Qdrant-Collection-Management-Basisklasse (analog MilvusCollectionBase).
+    Qdrant-Collection-Management-Basisklasse (analog ``MilvusCollectionBase``).
 
     Subclasses MUST define:
         _COLLECTION_NAME: ClassVar[str]
         _VECTOR_PARAMS: ClassVar[IndexConfig]
-        _PAYLOAD_INDEXES: ClassVar[list[str]] = []   # field names to index
 
     Optional:
-        _DB_USING: ClassVar[str] = "default"          # client name
+        _DB_USING: ClassVar[str] = "default"
 
-    Aktueller Stand (Phase 1.1 Skeleton): ``ensure_all()`` ist No-Op, damit
-    ``QdrantLifespanProvider.startup()`` ueber registrierte Subklassen
-    iterieren kann ohne Crash. Voll-Logik kommt im Sub-Commit.
+    Anders als das Milvus-Pendant gibt es keinen Alias-Mechanismus — die
+    Collection ist direkt unter ``_COLLECTION_NAME`` adressierbar.
+
+    Subclass-Beispiel::
+
+        class EpisodicMemoryCollection(QdrantCollectionBase):
+            _COLLECTION_NAME = "v1_episodic_memory"
+            _VECTOR_PARAMS = IndexConfig(
+                size=1024,
+                distance="cosine",
+                payload_indexes={
+                    "user_id":    "keyword",
+                    "group_id":   "keyword",
+                    "session_id": "keyword",
+                    "timestamp":  "integer",
+                },
+            )
+
+        coll = EpisodicMemoryCollection()
+        coll.ensure_all()
+        coll.upsert([...])
     """
 
     _COLLECTION_NAME: ClassVar[Optional[str]] = None
     _DB_USING: ClassVar[str] = "default"
     _VECTOR_PARAMS: ClassVar[Optional[IndexConfig]] = None
-    _PAYLOAD_INDEXES: ClassVar[List[str]] = []
 
     def __init__(self) -> None:
-        if self._COLLECTION_NAME is None:
+        if not self._COLLECTION_NAME:
             raise NotImplementedError(
-                f"{self.__class__.__name__} must define '_COLLECTION_NAME'"
+                f"{self.__class__.__name__} must define '_COLLECTION_NAME' "
+                "class attribute"
             )
+        if self._VECTOR_PARAMS is None:
+            raise NotImplementedError(
+                f"{self.__class__.__name__} must define '_VECTOR_PARAMS' "
+                "(IndexConfig) class attribute"
+            )
+        self._using = self._DB_USING or "default"
 
     @property
     def name(self) -> str:
-        # _COLLECTION_NAME ist nach __init__-Check garantiert nicht None
         return self._COLLECTION_NAME  # type: ignore[return-value]
 
     @property
     def using(self) -> str:
-        return self._DB_USING
+        return self._using
 
-    def ensure_all(self) -> None:
+    # ------------------------------------------------------------------ client
+
+    def client(self) -> QdrantClient:
         """
-        Stellt sicher dass Collection + Payload-Indexes existieren.
+        Resolve the cached Qdrant client for ``self.using`` via DI factory.
 
-        TODO Phase 1.2:
-        - ``client.collection_exists(name)`` pruefen
-        - falls nicht: ``client.create_collection(name, vectors_config=...)``
-        - pro ``_PAYLOAD_INDEXES``: ``client.create_payload_index(name, field)``
-          mit korrektem ``PayloadSchemaType`` (Keyword/Integer/Float/Bool).
-
-        Aktuell: No-Op + Debug-Log, damit Lifespan-Provider iterieren kann.
+        Looking up via the factory bean keeps client-caching centralized
+        (factory caches one QdrantClient instance per alias).
         """
-        logger.debug(
-            "QdrantCollectionBase.ensure_all() stub for '%s' [using=%s] "
-            "— TODO Phase 1.2",
+        # Lazy import to avoid a circular dependency: this module is imported
+        # at adapter-discovery time, before the DI container is fully wired.
+        from core.di.utils import get_bean
+
+        factory = get_bean("qdrant_client_factory")
+        return factory.get_named_client(self.using)
+
+    # ------------------------------------------------------------------ schema
+
+    def exists(self) -> bool:
+        """Return True if the underlying Qdrant collection already exists."""
+        try:
+            return self.client().collection_exists(self.name)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "collection_exists('%s') failed: %s — treating as non-existent",
+                self.name,
+                e,
+            )
+            return False
+
+    def count(self, exact: bool = True) -> int:
+        """Number of points in the collection."""
+        result = self.client().count(collection_name=self.name, exact=exact)
+        return result.count
+
+    def ensure_collection(self) -> None:
+        """
+        Create the Qdrant collection if it does not exist.
+
+        Idempotent: a pre-existing collection is left untouched, even if its
+        schema differs from ``_VECTOR_PARAMS`` — schema migration is an
+        explicit external concern.
+        """
+        if self.exists():
+            logger.debug(
+                "Qdrant collection '%s' already exists, skipping create",
+                self.name,
+            )
+            return
+
+        cfg = self._VECTOR_PARAMS
+        assert cfg is not None  # guarded by __init__
+        logger.info(
+            "Creating Qdrant collection '%s' (size=%d, distance=%s, on_disk=%s)",
             self.name,
-            self.using,
+            cfg.size,
+            cfg.distance,
+            cfg.on_disk,
+        )
+        self.client().create_collection(
+            collection_name=self.name,
+            vectors_config=cfg.to_vectors_config(),
         )
 
-    def upsert(self, points: List[Any]) -> None:
-        """TODO Phase 2: ``client.upsert(name, points=points)``."""
-        raise NotImplementedError("Phase 2: implement Qdrant upsert")
+    def ensure_payload_indexes(self) -> None:
+        """
+        Create payload-indexes for the fields declared in
+        ``_VECTOR_PARAMS.payload_indexes``.
 
-    def search(self, query_vector: List[float], **kwargs: Any) -> List[Any]:
-        """TODO Phase 2: ``client.search(name, query_vector, query_filter, ...)``."""
-        raise NotImplementedError("Phase 2: implement Qdrant search")
+        Qdrant treats ``create_payload_index`` as idempotent at the API level,
+        so we call it unconditionally per field.
+        """
+        cfg = self._VECTOR_PARAMS
+        assert cfg is not None
+        if not cfg.payload_indexes:
+            logger.debug(
+                "Qdrant collection '%s' has no declared payload indexes, skipping",
+                self.name,
+            )
+            return
 
-    def delete(self, point_ids: List[Any]) -> None:
-        """TODO Phase 2: ``client.delete(name, points_selector=PointIdsList(points=ids))``."""
-        raise NotImplementedError("Phase 2: implement Qdrant delete")
+        for field_name, schema_str in cfg.payload_indexes.items():
+            key = schema_str.strip().lower()
+            if key not in _PAYLOAD_SCHEMA_TYPE_MAP:
+                raise ValueError(
+                    f"Unknown payload schema '{schema_str}' for field "
+                    f"'{field_name}'. Supported: {sorted(_PAYLOAD_SCHEMA_TYPE_MAP)}"
+                )
+            schema_type = _PAYLOAD_SCHEMA_TYPE_MAP[key]
+            try:
+                self.client().create_payload_index(
+                    collection_name=self.name,
+                    field_name=field_name,
+                    field_schema=schema_type,
+                )
+                logger.info(
+                    "Ensured payload index on '%s.%s' (%s)",
+                    self.name,
+                    field_name,
+                    schema_str,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    "Failed to ensure payload index on '%s.%s': %s",
+                    self.name,
+                    field_name,
+                    e,
+                )
+                raise
+
+    def ensure_all(self) -> None:
+        """Idempotent one-shot init: collection + payload indexes."""
+        logger.info("Initializing Qdrant collection '%s' [using=%s]", self.name, self.using)
+        self.ensure_collection()
+        self.ensure_payload_indexes()
+        logger.info("Qdrant collection '%s' is ready", self.name)
+
+    # ----------------------------------------------------------- data methods
+
+    def upsert(
+        self,
+        points: List[qmodels.PointStruct],
+        wait: bool = True,
+    ) -> qmodels.UpdateResult:
+        """Upsert points (insert or overwrite by id)."""
+        return self.client().upsert(
+            collection_name=self.name,
+            points=points,
+            wait=wait,
+        )
+
+    def search(
+        self,
+        query_vector: List[float],
+        limit: int = 10,
+        query_filter: Optional[qmodels.Filter] = None,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+        score_threshold: Optional[float] = None,
+        **kwargs: Any,
+    ) -> List[qmodels.ScoredPoint]:
+        """
+        ANN search with optional payload-filter.
+
+        Implemented on top of ``QdrantClient.query_points`` (the legacy
+        ``search`` method was removed in qdrant-client 1.13+). The wrapper
+        keeps the more intuitive ``query_vector`` parameter name for callers
+        and unwraps ``QueryResponse.points`` so the return type stays a
+        ``List[ScoredPoint]``.
+        """
+        response = self.client().query_points(
+            collection_name=self.name,
+            query=query_vector,
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=with_payload,
+            with_vectors=with_vectors,
+            score_threshold=score_threshold,
+            **kwargs,
+        )
+        return response.points
+
+    def delete(
+        self,
+        point_ids: List[Any],
+        wait: bool = True,
+    ) -> qmodels.UpdateResult:
+        """Delete by point ids."""
+        return self.client().delete(
+            collection_name=self.name,
+            points_selector=qmodels.PointIdsList(points=point_ids),
+            wait=wait,
+        )
+
+    def drop(self) -> None:
+        """Drop the underlying Qdrant collection (DANGEROUS — irreversible)."""
+        try:
+            self.client().delete_collection(collection_name=self.name)
+            logger.info("Dropped Qdrant collection '%s'", self.name)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to drop Qdrant collection '%s' (may not exist): %s",
+                self.name,
+                e,
+            )
