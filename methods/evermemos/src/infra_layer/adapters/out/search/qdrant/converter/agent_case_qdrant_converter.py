@@ -71,7 +71,7 @@ class AgentCaseQdrantConverter(BaseQdrantConverter[AgentCaseCollection]):
             )
 
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Failed to convert AgentCaseRecord to Qdrant point: %s", e
             )
             raise

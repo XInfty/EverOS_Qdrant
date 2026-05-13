@@ -256,7 +256,7 @@ def sweep(
                 )
                 pairs_run += 1
             except Exception as e:
-                logger.error(
+                logger.exception(
                     "Pair %s.%s -> %s FAILED: %s",
                     db, spec.mongo_collection, qdrant_coll, e,
                 )

@@ -106,7 +106,9 @@ class EpisodicMemoryQdrantConverter(BaseQdrantConverter[EpisodicMemoryCollection
             )
 
         except Exception as e:
-            logger.error("Failed to convert MongoDB document to Qdrant point: %s", e)
+            logger.exception(
+                "Failed to convert MongoDB document to Qdrant point: %s", e
+            )
             raise
 
     @staticmethod

@@ -183,6 +183,13 @@ def build_payload(
                 payload[timestamp_field] = int(secs)
         elif isinstance(ts_value, (int, float)):
             payload[timestamp_field] = int(ts_value)
+        else:
+            # Silent drop would corrupt time-range filters downstream. Surface
+            # the bad doc so callers can decide whether to clean source data.
+            logger.warning(
+                "Skipping timestamp field '%s' with unexpected type %s for doc %s",
+                timestamp_field, type(ts_value).__name__, doc.get("_id"),
+            )
 
     # Persist the text used for the embedding for downstream search-result
     # surfaces (matches the Milvus converter's ``search_content`` payload).
@@ -264,128 +271,150 @@ def migrate(
     )
 
     mongo = MongoClient(config.mongo_uri)
-    qdrant = QdrantClient(host=config.qdrant_host, port=config.qdrant_port)
-    openai = OpenAI(
-        api_key=config.openrouter_api_key,
-        base_url=config.openrouter_base_url,
-    )
+    qdrant: Optional[QdrantClient] = None
+    try:
+        qdrant = QdrantClient(host=config.qdrant_host, port=config.qdrant_port)
+        # OpenAI client owns an httpx pool that's closed on GC; explicit close
+        # is best-effort below via the openai_client.close() call in finally.
+        openai = OpenAI(
+            api_key=config.openrouter_api_key,
+            base_url=config.openrouter_base_url,
+        )
 
-    coll = mongo[mongo_db][mongo_coll]
-    total_docs = coll.estimated_document_count()
-    logger.info("Source has ~%d documents", total_docs)
+        coll = mongo[mongo_db][mongo_coll]
+        total_docs = coll.estimated_document_count()
+        logger.info("Source has ~%d documents", total_docs)
 
-    if not dry_run:
-        ensure_qdrant_collection(qdrant, qdrant_coll, config.vectorize_dimensions)
+        if not dry_run:
+            ensure_qdrant_collection(qdrant, qdrant_coll, config.vectorize_dimensions)
 
-    cursor = coll.find()
-    if limit:
-        cursor = cursor.limit(limit)
+        cursor = coll.find()
+        if limit:
+            cursor = cursor.limit(limit)
 
-    processed = 0
-    skipped_existing = 0
-    skipped_no_text = 0
-    upserted = 0
-    started = time.time()
+        processed = 0
+        skipped_existing = 0
+        skipped_no_text = 0
+        upserted = 0
+        started = time.time()
 
-    batch_docs: List[Dict[str, Any]] = []
+        batch_docs: List[Dict[str, Any]] = []
 
-    def flush(batch: List[Dict[str, Any]]) -> Tuple[int, int, int]:
-        """Embed + upsert one batch. Returns (upserted, skipped_existing, skipped_no_text)."""
-        # Mongo ids are mapped to Qdrant point ids via uuid5; idempotent so
-        # the existence-check below works across reruns.
-        qdrant_ids = [mongo_id_to_qdrant_id(d["_id"]) for d in batch]
-        if force:
-            new_ids = qdrant_ids
-        else:
-            new_ids = (
-                filter_existing_ids(qdrant, qdrant_coll, qdrant_ids)
-                if not dry_run
-                else qdrant_ids
+        def flush(batch: List[Dict[str, Any]]) -> Tuple[int, int, int]:
+            """Embed + upsert one batch. Returns (upserted, skipped_existing, skipped_no_text)."""
+            # Mongo ids are mapped to Qdrant point ids via uuid5; idempotent so
+            # the existence-check below works across reruns.
+            qdrant_ids = [mongo_id_to_qdrant_id(d["_id"]) for d in batch]
+            if force:
+                new_ids = qdrant_ids
+            else:
+                new_ids = (
+                    filter_existing_ids(qdrant, qdrant_coll, qdrant_ids)
+                    if not dry_run
+                    else qdrant_ids
+                )
+            new_set = set(new_ids)
+            new_docs = [
+                d for d, qid in zip(batch, qdrant_ids) if qid in new_set
+            ]
+            # Carry the resolved qdrant id alongside the doc so we don't recompute
+            # the uuid5 twice; attach as a temporary key on a shallow copy.
+            new_pairs: List[Tuple[Dict[str, Any], str]] = [
+                (d, qid) for d, qid in zip(batch, qdrant_ids) if qid in new_set
+            ]
+
+            texts: List[str] = []
+            kept_pairs: List[Tuple[Dict[str, Any], str]] = []
+            for d, qid in new_pairs:
+                text = extract_text(d, text_field, extra_text_fields)
+                if not text:
+                    continue
+                texts.append(text)
+                kept_pairs.append((d, qid))
+
+            if dry_run:
+                return (
+                    len(kept_pairs),
+                    len(batch) - len(new_docs),
+                    len(new_docs) - len(kept_pairs),
+                )
+
+            if not texts:
+                return (
+                    0,
+                    len(batch) - len(new_docs),
+                    len(new_docs) - len(kept_pairs),
+                )
+
+            vectors = embed_batch(
+                openai, config.vectorize_model, config.vectorize_dimensions, texts
             )
-        new_set = set(new_ids)
-        new_docs = [
-            d for d, qid in zip(batch, qdrant_ids) if qid in new_set
-        ]
-        # Carry the resolved qdrant id alongside the doc so we don't recompute
-        # the uuid5 twice; attach as a temporary key on a shallow copy.
-        new_pairs: List[Tuple[Dict[str, Any], str]] = [
-            (d, qid) for d, qid in zip(batch, qdrant_ids) if qid in new_set
-        ]
 
-        texts: List[str] = []
-        kept_pairs: List[Tuple[Dict[str, Any], str]] = []
-        for d, qid in new_pairs:
-            text = extract_text(d, text_field, extra_text_fields)
-            if not text:
-                continue
-            texts.append(text)
-            kept_pairs.append((d, qid))
+            points: List[qmodels.PointStruct] = []
+            for (d, qid), vec in zip(kept_pairs, vectors):
+                payload = build_payload(
+                    d, payload_fields, timestamp_field, timestamp_unit,
+                    text_field, extra_text_fields,
+                )
+                # Keep the original Mongo id in the payload so reverse-lookup
+                # from Qdrant -> Mongo is trivial.
+                payload["mongo_id"] = str(d["_id"])
+                points.append(
+                    qmodels.PointStruct(id=qid, vector=vec, payload=payload)
+                )
 
-        if dry_run:
+            qdrant.upsert(collection_name=qdrant_coll, points=points, wait=True)
             return (
-                len(kept_pairs),
+                len(points),
                 len(batch) - len(new_docs),
                 len(new_docs) - len(kept_pairs),
             )
 
-        if not texts:
-            return (
-                0,
-                len(batch) - len(new_docs),
-                len(new_docs) - len(kept_pairs),
-            )
+        for doc in cursor:
+            batch_docs.append(doc)
+            if len(batch_docs) >= batch_size:
+                u, s_e, s_n = flush(batch_docs)
+                upserted += u
+                skipped_existing += s_e
+                skipped_no_text += s_n
+                processed += len(batch_docs)
+                logger.info(
+                    "Progress: processed=%d upserted=%d skipped_existing=%d skipped_no_text=%d elapsed=%.1fs",
+                    processed, upserted, skipped_existing, skipped_no_text,
+                    time.time() - started,
+                )
+                batch_docs = []
 
-        vectors = embed_batch(
-            openai, config.vectorize_model, config.vectorize_dimensions, texts
-        )
-
-        points: List[qmodels.PointStruct] = []
-        for (d, qid), vec in zip(kept_pairs, vectors):
-            payload = build_payload(
-                d, payload_fields, timestamp_field, timestamp_unit,
-                text_field, extra_text_fields,
-            )
-            # Keep the original Mongo id in the payload so reverse-lookup
-            # from Qdrant -> Mongo is trivial.
-            payload["mongo_id"] = str(d["_id"])
-            points.append(
-                qmodels.PointStruct(id=qid, vector=vec, payload=payload)
-            )
-
-        qdrant.upsert(collection_name=qdrant_coll, points=points, wait=True)
-        return (
-            len(points),
-            len(batch) - len(new_docs),
-            len(new_docs) - len(kept_pairs),
-        )
-
-    for doc in cursor:
-        batch_docs.append(doc)
-        if len(batch_docs) >= batch_size:
+        if batch_docs:
             u, s_e, s_n = flush(batch_docs)
             upserted += u
             skipped_existing += s_e
             skipped_no_text += s_n
             processed += len(batch_docs)
-            logger.info(
-                "Progress: processed=%d upserted=%d skipped_existing=%d skipped_no_text=%d elapsed=%.1fs",
-                processed, upserted, skipped_existing, skipped_no_text,
-                time.time() - started,
-            )
-            batch_docs = []
 
-    if batch_docs:
-        u, s_e, s_n = flush(batch_docs)
-        upserted += u
-        skipped_existing += s_e
-        skipped_no_text += s_n
-        processed += len(batch_docs)
-
-    logger.info(
-        "DONE: processed=%d upserted=%d skipped_existing=%d skipped_no_text=%d elapsed=%.1fs",
-        processed, upserted, skipped_existing, skipped_no_text,
-        time.time() - started,
-    )
+        logger.info(
+            "DONE: processed=%d upserted=%d skipped_existing=%d skipped_no_text=%d elapsed=%.1fs",
+            processed, upserted, skipped_existing, skipped_no_text,
+            time.time() - started,
+        )
+    finally:
+        # Close connections in reverse construction order. Best-effort: a
+        # failing close should not mask a real exception from the body.
+        try:
+            close_fn = getattr(openai, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:  # noqa: BLE001
+            logger.debug("openai.close() raised; ignoring during cleanup", exc_info=True)
+        try:
+            if qdrant is not None:
+                qdrant.close()
+        except Exception:  # noqa: BLE001
+            logger.debug("qdrant.close() raised; ignoring during cleanup", exc_info=True)
+        try:
+            mongo.close()
+        except Exception:  # noqa: BLE001
+            logger.debug("mongo.close() raised; ignoring during cleanup", exc_info=True)
 
 
 # =================================================================== CLI
