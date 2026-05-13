@@ -1,3 +1,42 @@
+> [!NOTE]
+> ## Fork — Qdrant Migration
+>
+> This fork of [`EverMind-AI/EverOS`](https://github.com/EverMind-AI/EverOS) focuses on
+> **migrating the vector backend from Milvus to Qdrant**.
+>
+> ### Why
+>
+> Milvus standalone with embedded etcd showed repeated startup races
+> (`panic: etcdserver: leader changed`) leading to crash-loops and RAM
+> exhaustion in our deployment. Rather than stacking more etcd workarounds, we
+> migrate to Qdrant — whose architecture has no separate coordinator service.
+>
+> ### Status
+>
+> - `main` — tracks upstream `EverMind-AI/EverOS`.
+> - `feature/qdrant-adapter` — work in progress. Phase 1: adapter skeleton.
+>
+> ### Approach
+>
+> EverOS' `src/infra_layer/adapters/out/search/` already supports multiple
+> backends (Milvus + Elasticsearch). We add a Qdrant adapter under
+> `src/core/oxm/qdrant/` and route via `VECTOR_STORE_BACKEND=qdrant`. The
+> Milvus adapter stays untouched until cutover.
+>
+> ### Concept Mapping
+>
+> | Milvus               | Qdrant                            |
+> | -------------------- | --------------------------------- |
+> | Collection           | Collection (1:1)                  |
+> | FieldSchema (vector) | `VectorParams(size, distance)`    |
+> | FieldSchema (scalar) | Payload field (schema-flexible)   |
+> | HNSW + COSINE        | `HnswConfig` + `Distance.Cosine`  |
+> | Partition            | Payload field OR separate coll.   |
+>
+> Reference: [Qdrant Migration Guide — From Milvus](https://qdrant.tech/documentation/migrate-to-qdrant/from-milvus/).
+
+---
+
 <div align="center" id="readme-top">
 
 ![banner-gif](https://github.com/user-attachments/assets/c2cef808-3e93-4f81-a194-dffe02ddd984)
