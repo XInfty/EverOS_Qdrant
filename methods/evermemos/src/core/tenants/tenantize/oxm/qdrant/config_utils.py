@@ -115,8 +115,13 @@ def get_qdrant_connection_cache_key(config: Dict[str, Any]) -> str:
 
     api_key = config.get("api_key")
     if api_key:
-        # Hash the api_key fingerprint, not the raw value.
-        endpoint += f"#{sha256(api_key.encode('utf-8')).hexdigest()[:8]}"
+        # Hash the api_key fingerprint, not the raw value. Tolerate bytes,
+        # str, or other types — coerce safely before hashing.
+        if isinstance(api_key, bytes):
+            key_bytes = api_key
+        else:
+            key_bytes = str(api_key).encode("utf-8")
+        endpoint += f"#{sha256(key_bytes).hexdigest()[:8]}"
 
     return endpoint
 
@@ -144,9 +149,24 @@ def _load_qdrant_env(prefix: str = "") -> Dict[str, Any]:
             return os.getenv(key, "")
         return os.getenv(key, default)
 
+    def _safe_port(raw: str, default: int) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid QDRANT_PORT value %r — falling back to %d", raw, default
+            )
+            return default
+        if not (1 <= value <= 65535):
+            logger.warning(
+                "QDRANT_PORT %d out of TCP range — falling back to %d", value, default
+            )
+            return default
+        return value
+
     return {
         "host": _env("QDRANT_HOST", "localhost"),
-        "port": int(_env("QDRANT_PORT", "6333")),
+        "port": _safe_port(_env("QDRANT_PORT", "6333"), 6333),
         "api_key": _env("QDRANT_API_KEY") or None,
         "https": _env("QDRANT_HTTPS", "").strip().lower() in {"1", "true", "yes", "on"},
         "prefer_grpc": _env("QDRANT_PREFER_GRPC", "").strip().lower()

@@ -33,9 +33,18 @@ class AgentSkillQdrantConverter(BaseQdrantConverter[AgentSkillCollection]):
             Exception: on any conversion failure (logged + re-raised).
         """
         if source_doc is None:
-            raise ValueError("MongoDB document cannot be empty")
+            raise ValueError("MongoDB document cannot be None")
+        if source_doc.id is None:
+            raise ValueError("AgentSkillRecord.id must not be None")
 
         try:
+            vector = source_doc.vector if source_doc.vector else None
+            if not vector:
+                raise ValueError(
+                    f"Vector is required for AgentSkillRecord {source_doc.id} "
+                    "but was not populated"
+                )
+
             name = source_doc.name or ""
             description = source_doc.description or ""
 
@@ -61,8 +70,6 @@ class AgentSkillQdrantConverter(BaseQdrantConverter[AgentSkillCollection]):
                     else 0.0
                 ),
             }
-
-            vector = source_doc.vector if source_doc.vector else []
 
             return qmodels.PointStruct(
                 id=str(source_doc.id),

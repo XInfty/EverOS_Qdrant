@@ -93,11 +93,13 @@ class AgentSkillQdrantRepository(BaseQdrantRepository[AgentSkillCollection]):
                     )
                 )
 
-            if user_id != MAGIC_ALL:
+            if user_id and user_id != MAGIC_ALL:
+                # ``None``/empty user_id means "do not filter" (search across
+                # the whole tenant), not "match the empty-string user_id".
                 conditions.append(
                     qmodels.FieldCondition(
                         key="user_id",
-                        match=qmodels.MatchValue(value=user_id or ""),
+                        match=qmodels.MatchValue(value=user_id),
                     )
                 )
 
@@ -198,20 +200,19 @@ class AgentSkillQdrantRepository(BaseQdrantRepository[AgentSkillCollection]):
             client = self.collection.client()
             name = self.collection.name
 
-            # Best-effort count via scroll (Qdrant ``delete(filter=)`` doesn't
-            # return the deleted-point count). Same idiom as the Milvus
-            # repository which queries first, then deletes.
-            scrolled, _ = await asyncio.to_thread(
+            # Use Qdrant's ``count`` for an exact total instead of a single
+            # scroll page (which could undercount when the cluster has more
+            # than the page limit). After counting we issue a single
+            # filter-based delete that covers all matches.
+            count_result = await asyncio.to_thread(
                 partial(
-                    client.scroll,
+                    client.count,
                     collection_name=name,
-                    scroll_filter=filter_,
-                    limit=10_000,
-                    with_payload=False,
-                    with_vectors=False,
+                    count_filter=filter_,
+                    exact=True,
                 )
             )
-            count = len(scrolled)
+            count = count_result.count
 
             if count > 0:
                 await asyncio.to_thread(
@@ -231,4 +232,7 @@ class AgentSkillQdrantRepository(BaseQdrantRepository[AgentSkillCollection]):
             logger.error(
                 "Failed to delete Qdrant points for cluster=%s: %s", cluster_id, e
             )
-            return 0
+            # Re-raise so callers can distinguish a genuine zero from an
+            # operational failure (consistent with upsert/search/delete_batch
+            # in the base repository).
+            raise

@@ -8,6 +8,7 @@ Provides Qdrant client connection functionality based on environment variables.
 """
 
 import os
+import threading
 from typing import Dict, Optional
 
 from qdrant_client import QdrantClient
@@ -56,23 +57,49 @@ def get_qdrant_config(prefix: str = "") -> dict:
             return os.getenv(key, "")
         return os.getenv(key, default)
 
+    def _parse_port(name: str, default: int) -> int:
+        """Parse a numeric port env var, falling back to ``default`` on invalid input."""
+        raw = _env(name, str(default))
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid %s value %r — falling back to default %d", name, raw, default
+            )
+            return default
+        if not (1 <= value <= 65535):
+            logger.warning(
+                "%s value %d out of TCP range 1-65535 — falling back to default %d",
+                name, value, default,
+            )
+            return default
+        return value
+
     host = _env("QDRANT_HOST", "localhost")
-    port = int(_env("QDRANT_PORT", "6333"))
-    grpc_port = int(_env("QDRANT_GRPC_PORT", "6334"))
+    port = _parse_port("QDRANT_PORT", 6333)
+    grpc_port = _parse_port("QDRANT_GRPC_PORT", 6334)
     # api_key / https sind explizit None wenn env nicht gesetzt — so kann
     # qdrant-client die Defaults / URL-Scheme-Detection selbst uebernehmen.
     api_key_raw = _env("QDRANT_API_KEY")
     api_key: Optional[str] = api_key_raw or None
-    https_raw = os.getenv(f"{prefix.upper()}_QDRANT_HTTPS" if prefix else "QDRANT_HTTPS")
-    https: Optional[bool] = _truthy(https_raw) if https_raw is not None else None
+    https_raw = _env("QDRANT_HTTPS")
+    https: Optional[bool] = _truthy(https_raw) if https_raw else None
     prefer_grpc = _truthy(_env("QDRANT_PREFER_GRPC", "false"))
-    timeout = int(_env("QDRANT_TIMEOUT", "30"))
+    try:
+        timeout = int(_env("QDRANT_TIMEOUT", "30"))
+    except (TypeError, ValueError):
+        logger.warning("Invalid QDRANT_TIMEOUT value — falling back to 30")
+        timeout = 30
 
-    # URL-Assembly: wenn https explizit gesetzt, halte die Praeferenz. Sonst http.
-    scheme = "https" if https else "http"
-    if host.startswith("http://") or host.startswith("https://"):
-        url = f"{host}:{port}"
+    # URL-Assembly. If host already carries a scheme/port, take it verbatim — the
+    # caller has explicitly chosen what to connect to. Otherwise build the URL
+    # from scheme + host + port; when ``https`` is unset (None) the qdrant-client
+    # SDK does its own scheme inference, so we still default to "http" in the URL
+    # string for the log/config dict only.
+    if host.startswith(("http://", "https://")):
+        url = host if ":" in host.split("//", 1)[1] else f"{host}:{port}"
     else:
+        scheme = "https" if https else "http"
         url = f"{scheme}://{host}:{port}"
 
     config = {
@@ -115,12 +142,10 @@ class QdrantClientFactory:
     def __init__(self) -> None:
         self._clients: Dict[str, QdrantClient] = {}
         self._default_config: Optional[dict] = None
-        # Note: typischer use-case ist single-init in lifespan-startup, daher
-        # kein Lock noetig. Bei concurrent access aus FastAPI-Coroutines auf
-        # verschiedene named clients kann theoretisch eine Race entstehen
-        # (beide passen den cache-miss-check, beide erstellen Client, einer
-        # ueberschreibt den anderen im dict). Fix in Phase 2 via threading.Lock
-        # falls Concurrent-Pattern auftritt.
+        # threading.Lock guards the check-then-create cache miss path so two
+        # concurrent FastAPI requests for the same alias don't both build a
+        # QdrantClient (with one silently overwriting the other).
+        self._lock = threading.Lock()
         logger.info("QdrantClientFactory initialized")
 
     def get_client(
@@ -157,37 +182,47 @@ class QdrantClientFactory:
         Returns:
             ``QdrantClient`` (gecached pro ``alias``).
         """
-        cache_key = alias or "default"
+        # Normalize cache key so that ``default``, ``Default`` and ``DEFAULT``
+        # all share the same cached client.
+        cache_key = (alias or "default").lower()
+
+        # Fast-path without lock acquisition.
         if cache_key in self._clients:
             return self._clients[cache_key]
 
-        client_kwargs: dict = {
-            "prefer_grpc": prefer_grpc,
-            "grpc_port": grpc_port,
-            "timeout": timeout,
-        }
-        if api_key:
-            client_kwargs["api_key"] = api_key
-        if https is not None:
-            client_kwargs["https"] = https
-        if url:
-            client_kwargs["url"] = url
-        else:
-            client_kwargs["host"] = host or "localhost"
-            client_kwargs["port"] = port
+        with self._lock:
+            # Double-checked locking: re-verify under the lock so concurrent
+            # waiters don't all build a new client.
+            if cache_key in self._clients:
+                return self._clients[cache_key]
 
-        client_kwargs.update(kwargs)
+            client_kwargs: dict = {
+                "prefer_grpc": prefer_grpc,
+                "grpc_port": grpc_port,
+                "timeout": timeout,
+            }
+            if api_key:
+                client_kwargs["api_key"] = api_key
+            if https is not None:
+                client_kwargs["https"] = https
+            if url:
+                client_kwargs["url"] = url
+            else:
+                client_kwargs["host"] = host or "localhost"
+                client_kwargs["port"] = port
 
-        client = QdrantClient(**client_kwargs)
-        self._clients[cache_key] = client
-        logger.info(
-            "Qdrant client created and cached: %s (alias=%s, prefer_grpc=%s, https=%s)",
-            url or f"{client_kwargs.get('host')}:{port}",
-            cache_key,
-            prefer_grpc,
-            https,
-        )
-        return client
+            client_kwargs.update(kwargs)
+
+            client = QdrantClient(**client_kwargs)
+            self._clients[cache_key] = client
+            logger.info(
+                "Qdrant client created and cached: %s (alias=%s, prefer_grpc=%s, https=%s)",
+                url or f"{client_kwargs.get('host')}:{port}",
+                cache_key,
+                prefer_grpc,
+                https,
+            )
+            return client
 
     def get_default_client(self) -> QdrantClient:
         """Get default Qdrant client basierend auf Env-Konfiguration."""
@@ -216,11 +251,12 @@ class QdrantClientFactory:
         Returns:
             ``QdrantClient`` (gecached unter ``name``).
         """
-        if name.lower() == "default":
+        normalized = name.lower()
+        if normalized == "default":
             return self.get_default_client()
 
         cfg = get_qdrant_config(prefix=name)
-        logger.info("Loading named Qdrant config [name=%s]: %s", name, cfg["url"])
+        logger.info("Loading named Qdrant config [name=%s]: %s", normalized, cfg["url"])
 
         return self.get_client(
             url=cfg["url"],
@@ -229,7 +265,7 @@ class QdrantClientFactory:
             prefer_grpc=cfg["prefer_grpc"],
             grpc_port=cfg["grpc_port"],
             timeout=cfg["timeout"],
-            alias=name,
+            alias=normalized,
         )
 
     def close_all_clients(self) -> None:

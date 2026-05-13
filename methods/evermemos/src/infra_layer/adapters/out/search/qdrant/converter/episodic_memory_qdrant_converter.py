@@ -53,7 +53,9 @@ class EpisodicMemoryQdrantConverter(BaseQdrantConverter[EpisodicMemoryCollection
             Exception: on any conversion failure (logged + re-raised).
         """
         if source_doc is None:
-            raise ValueError("MongoDB document cannot be empty")
+            raise ValueError("MongoDB document cannot be None")
+        if source_doc.id is None:
+            raise ValueError("EpisodicMemory.id must not be None")
 
         try:
             # Timestamp -> epoch milliseconds (integer, parity with Milvus).
@@ -84,8 +86,13 @@ class EpisodicMemoryQdrantConverter(BaseQdrantConverter[EpisodicMemoryCollection
             vector = (
                 source_doc.vector
                 if hasattr(source_doc, "vector") and source_doc.vector
-                else []
+                else None
             )
+            if not vector:
+                raise ValueError(
+                    f"Vector is required for EpisodicMemory {source_doc.id} "
+                    "but was not populated"
+                )
 
             return qmodels.PointStruct(
                 id=str(source_doc.id),
