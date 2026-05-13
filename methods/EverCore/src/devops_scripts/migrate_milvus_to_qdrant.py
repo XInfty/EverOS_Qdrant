@@ -65,6 +65,10 @@ from pymongo import MongoClient
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
+# Stable, namespace-shared with the repository layer so script-side and
+# service-side ids agree on the same Mongo->Qdrant translation.
+from core.oxm.qdrant.base_repository import mongo_id_to_qdrant_id
+
 logger = logging.getLogger("migrate")
 
 
@@ -279,45 +283,73 @@ def migrate(
 
     def flush(batch: List[Dict[str, Any]]) -> Tuple[int, int, int]:
         """Embed + upsert one batch. Returns (upserted, skipped_existing, skipped_no_text)."""
-        ids = [str(d["_id"]) for d in batch]
+        # Mongo ids are mapped to Qdrant point ids via uuid5; idempotent so
+        # the existence-check below works across reruns.
+        qdrant_ids = [mongo_id_to_qdrant_id(d["_id"]) for d in batch]
         if force:
-            new_ids = ids
+            new_ids = qdrant_ids
         else:
-            new_ids = filter_existing_ids(qdrant, qdrant_coll, ids) if not dry_run else ids
+            new_ids = (
+                filter_existing_ids(qdrant, qdrant_coll, qdrant_ids)
+                if not dry_run
+                else qdrant_ids
+            )
         new_set = set(new_ids)
-        new_docs = [d for d in batch if str(d["_id"]) in new_set]
+        new_docs = [
+            d for d, qid in zip(batch, qdrant_ids) if qid in new_set
+        ]
+        # Carry the resolved qdrant id alongside the doc so we don't recompute
+        # the uuid5 twice; attach as a temporary key on a shallow copy.
+        new_pairs: List[Tuple[Dict[str, Any], str]] = [
+            (d, qid) for d, qid in zip(batch, qdrant_ids) if qid in new_set
+        ]
 
         texts: List[str] = []
-        kept_docs: List[Dict[str, Any]] = []
-        for d in new_docs:
+        kept_pairs: List[Tuple[Dict[str, Any], str]] = []
+        for d, qid in new_pairs:
             text = extract_text(d, text_field, extra_text_fields)
             if not text:
                 continue
             texts.append(text)
-            kept_docs.append(d)
+            kept_pairs.append((d, qid))
 
         if dry_run:
-            return len(kept_docs), len(batch) - len(new_docs), len(new_docs) - len(kept_docs)
+            return (
+                len(kept_pairs),
+                len(batch) - len(new_docs),
+                len(new_docs) - len(kept_pairs),
+            )
 
         if not texts:
-            return 0, len(batch) - len(new_docs), len(new_docs) - len(kept_docs)
+            return (
+                0,
+                len(batch) - len(new_docs),
+                len(new_docs) - len(kept_pairs),
+            )
 
         vectors = embed_batch(
             openai, config.vectorize_model, config.vectorize_dimensions, texts
         )
 
         points: List[qmodels.PointStruct] = []
-        for d, vec in zip(kept_docs, vectors):
+        for (d, qid), vec in zip(kept_pairs, vectors):
             payload = build_payload(
                 d, payload_fields, timestamp_field, timestamp_unit,
                 text_field, extra_text_fields,
             )
+            # Keep the original Mongo id in the payload so reverse-lookup
+            # from Qdrant -> Mongo is trivial.
+            payload["mongo_id"] = str(d["_id"])
             points.append(
-                qmodels.PointStruct(id=str(d["_id"]), vector=vec, payload=payload)
+                qmodels.PointStruct(id=qid, vector=vec, payload=payload)
             )
 
         qdrant.upsert(collection_name=qdrant_coll, points=points, wait=True)
-        return len(points), len(batch) - len(new_docs), len(new_docs) - len(kept_docs)
+        return (
+            len(points),
+            len(batch) - len(new_docs),
+            len(new_docs) - len(kept_pairs),
+        )
 
     for doc in cursor:
         batch_docs.append(doc)
