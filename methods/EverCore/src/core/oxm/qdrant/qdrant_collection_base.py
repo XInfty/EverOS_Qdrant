@@ -211,7 +211,13 @@ class QdrantCollectionBase:
             return
 
         cfg = self._VECTOR_PARAMS
-        assert cfg is not None  # guarded by __init__
+        # ``__init__`` already enforces this — explicit check guards against
+        # subclasses that override ``__init__`` without invoking ``super``,
+        # and survives ``python -O`` (where ``assert`` is stripped).
+        if cfg is None:
+            raise RuntimeError(
+                f"{self.__class__.__name__}._VECTOR_PARAMS is None"
+            )
         logger.info(
             "Creating Qdrant collection '%s' (size=%d, distance=%s, on_disk=%s)",
             self.name,
@@ -335,13 +341,20 @@ class QdrantCollectionBase:
         )
 
     def drop(self) -> None:
-        """Drop the underlying Qdrant collection (DANGEROUS — irreversible)."""
+        """
+        Drop the underlying Qdrant collection (DANGEROUS — irreversible).
+
+        Errors (network, auth, permission) are logged and re-raised so the
+        caller can react. Use ``exists()`` beforehand to handle the
+        already-absent case explicitly without relying on swallowed errors.
+        """
         try:
             self.client().delete_collection(collection_name=self.name)
             logger.info("Dropped Qdrant collection '%s'", self.name)
         except Exception as e:  # noqa: BLE001
             logger.warning(
-                "Failed to drop Qdrant collection '%s' (may not exist): %s",
+                "Failed to drop Qdrant collection '%s': %s",
                 self.name,
                 e,
             )
+            raise

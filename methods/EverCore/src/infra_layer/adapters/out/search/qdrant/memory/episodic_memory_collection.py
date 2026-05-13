@@ -10,7 +10,7 @@ Wire-Layout per point::
 
     PointStruct(
         id=<str event_id>,
-        vector=<List[float] dim=1024>,
+        vector=<List[float] dim=VECTORIZE_DIMENSIONS>,
         payload={
             "user_id":        str | "",
             "group_id":       str | "",

@@ -122,7 +122,9 @@ class BaseQdrantRepository(ABC, Generic[T]):
         Retrieve a single point by id. Returns ``None`` if not found.
 
         Qdrant accepts both ``int`` and ``str`` (UUID) point ids — pass
-        whichever id type was used at upsert time.
+        whichever id type was used at upsert time. Operational errors
+        (network, auth, malformed id type) are logged and re-raised; only
+        the legitimate "not found" case yields ``None``.
         """
         try:
             records = await asyncio.to_thread(
@@ -132,7 +134,6 @@ class BaseQdrantRepository(ABC, Generic[T]):
                 with_payload,
                 with_vectors,
             )
-            return records[0] if records else None
         except Exception as e:
             logger.error(
                 "Qdrant find_by_id failed [%s, id=%s]: %s",
@@ -140,7 +141,8 @@ class BaseQdrantRepository(ABC, Generic[T]):
                 point_id,
                 e,
             )
-            return None
+            raise
+        return records[0] if records else None
 
     async def find_by_ids(
         self,
@@ -148,7 +150,13 @@ class BaseQdrantRepository(ABC, Generic[T]):
         with_payload: bool = True,
         with_vectors: bool = False,
     ) -> List[qmodels.Record]:
-        """Batch retrieval by ids. Order of result is not guaranteed."""
+        """
+        Batch retrieval by ids. Order of result is not guaranteed.
+
+        Returns an empty list when none of the ids exist; raises on any
+        operational error so callers can distinguish "all-missing" from a
+        retrieval failure.
+        """
         try:
             return await asyncio.to_thread(
                 self.collection.client().retrieve,
@@ -164,20 +172,22 @@ class BaseQdrantRepository(ABC, Generic[T]):
                 len(point_ids),
                 e,
             )
-            return []
+            raise
 
     async def delete_by_id(
         self,
         point_id: Any,
         wait: bool = True,
     ) -> bool:
-        """Delete a single point. Returns ``True`` on success."""
+        """
+        Delete a single point. Returns ``True`` on a successful round-trip.
+
+        Operational errors are logged and re-raised (consistent with
+        ``upsert`` / ``delete_batch``); the ``bool`` return type is kept
+        for caller-parity with the Milvus repository.
+        """
         try:
             await asyncio.to_thread(self.collection.delete, [point_id], wait)
-            logger.debug(
-                "Qdrant delete successful [%s]: %s", self.model_name, point_id
-            )
-            return True
         except Exception as e:
             logger.error(
                 "Qdrant delete failed [%s, id=%s]: %s",
@@ -185,7 +195,11 @@ class BaseQdrantRepository(ABC, Generic[T]):
                 point_id,
                 e,
             )
-            return False
+            raise
+        logger.debug(
+            "Qdrant delete successful [%s]: %s", self.model_name, point_id
+        )
+        return True
 
     async def delete_batch(
         self,

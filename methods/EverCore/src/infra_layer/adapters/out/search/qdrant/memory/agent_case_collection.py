@@ -9,7 +9,7 @@ Wire-Layout per point::
 
     PointStruct(
         id=<str AgentCaseRecord id>,
-        vector=<List[float] dim=1024>,
+        vector=<List[float] dim=VECTORIZE_DIMENSIONS>,
         payload={
             "user_id":     str | "",
             "group_id":    str | "",

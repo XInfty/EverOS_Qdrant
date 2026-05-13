@@ -177,16 +177,18 @@ class EpisodicMemoryQdrantRepository(BaseQdrantRepository[EpisodicMemoryCollecti
             query_filter = qmodels.Filter(must=conditions) if conditions else None
             ef_value = max(128, limit * 2)
             # Two-stage score gating (parity with Milvus repository):
-            #   - ``effective_threshold`` is the wider net passed to Qdrant
-            #     server-side via ``score_threshold`` (``radius`` overrides if
-            #     explicitly set above -1.0; otherwise ``score_threshold``).
-            #   - The client-side ``point.score < score_threshold`` post-filter
-            #     enforces the hard caller-facing minimum, allowing callers
-            #     to widen the recall via ``radius`` while keeping a stricter
-            #     cut-off in the returned list.
-            effective_threshold = (
-                radius if (radius is not None and radius > -1.0) else score_threshold
-            )
+            #   - Server-side: pass the *more permissive* (lower) of
+            #     ``radius`` and ``score_threshold`` so Qdrant returns the
+            #     wider net.
+            #   - Client-side: the ``point.score < score_threshold`` post-
+            #     filter enforces the hard caller-facing minimum.
+            # This way callers can use ``radius`` to widen recall without
+            # accidentally making the server-side cut stricter than the
+            # caller's own cut-off.
+            if radius is not None and radius > -1.0:
+                effective_threshold = min(radius, score_threshold)
+            else:
+                effective_threshold = score_threshold
 
             scored_points = await self.search(
                 query_vector=query_vector,
@@ -283,18 +285,19 @@ class EpisodicMemoryQdrantRepository(BaseQdrantRepository[EpisodicMemoryCollecti
             client = self.collection.client()
             name = self.collection.name
 
-            # Count first (Qdrant ``delete(filter=)`` doesn't return a count).
-            scrolled, _ = await asyncio.to_thread(
+            # Use Qdrant's exact ``count`` instead of a bounded scroll page,
+            # so the returned count reflects the *full* number of points
+            # the filter matches (a 10k scroll cap would undercount large
+            # tenants and produce a misleading return value).
+            count_result = await asyncio.to_thread(
                 partial(
-                    client.scroll,
+                    client.count,
                     collection_name=name,
-                    scroll_filter=filter_,
-                    limit=10_000,
-                    with_payload=False,
-                    with_vectors=False,
+                    count_filter=filter_,
+                    exact=True,
                 )
             )
-            delete_count = len(scrolled)
+            delete_count = count_result.count
 
             if delete_count > 0:
                 await asyncio.to_thread(

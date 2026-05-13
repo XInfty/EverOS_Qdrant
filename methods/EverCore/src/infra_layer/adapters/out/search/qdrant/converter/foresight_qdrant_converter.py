@@ -47,7 +47,9 @@ class ForesightQdrantConverter(BaseQdrantConverter[ForesightCollection]):
         Milvus template, which always multiplies numeric inputs by 1000 and
         thus would corrupt already-ms inputs.
         """
-        if not time_value:
+        # Explicit ``is None`` so a legitimate epoch 0 / datetime(1970-01-01)
+        # is not silently dropped as "missing".
+        if time_value is None:
             return 0
 
         try:
@@ -79,7 +81,9 @@ class ForesightQdrantConverter(BaseQdrantConverter[ForesightCollection]):
             Exception: on any conversion failure (logged + re-raised).
         """
         if source_doc is None:
-            raise ValueError("MongoDB document cannot be empty")
+            raise ValueError("MongoDB document cannot be None")
+        if source_doc.id is None:
+            raise ValueError("ForesightRecord.id must not be None")
 
         try:
             start_time = cls._parse_time_field(
@@ -116,7 +120,12 @@ class ForesightQdrantConverter(BaseQdrantConverter[ForesightCollection]):
                 ),
             }
 
-            vector = source_doc.vector if source_doc.vector else []
+            vector = source_doc.vector if source_doc.vector else None
+            if not vector:
+                raise ValueError(
+                    f"Vector is required for ForesightRecord {source_doc.id} "
+                    "but was not populated"
+                )
 
             return qmodels.PointStruct(
                 id=str(source_doc.id),

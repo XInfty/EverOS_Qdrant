@@ -33,9 +33,18 @@ class AgentCaseQdrantConverter(BaseQdrantConverter[AgentCaseCollection]):
             Exception: on any conversion failure (logged + re-raised).
         """
         if source_doc is None:
-            raise ValueError("MongoDB document cannot be empty")
+            raise ValueError("MongoDB document cannot be None")
+        if source_doc.id is None:
+            raise ValueError("AgentCaseRecord.id must not be None")
 
         try:
+            vector = source_doc.vector if source_doc.vector else None
+            if not vector:
+                raise ValueError(
+                    f"Vector is required for AgentCaseRecord {source_doc.id} "
+                    "but was not populated"
+                )
+
             task_intent = source_doc.task_intent or ""
             # Parity with Milvus converter: epoch seconds (not ms) for this collection.
             timestamp_s = (
@@ -51,8 +60,6 @@ class AgentCaseQdrantConverter(BaseQdrantConverter[AgentCaseCollection]):
                 "parent_type": source_doc.parent_type or "",
                 "parent_id": source_doc.parent_id or "",
             }
-
-            vector = source_doc.vector if source_doc.vector else []
 
             return qmodels.PointStruct(
                 id=str(source_doc.id),
