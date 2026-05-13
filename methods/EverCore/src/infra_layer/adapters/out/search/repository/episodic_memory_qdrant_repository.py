@@ -1,0 +1,316 @@
+"""
+Episodic Memory Qdrant Repository.
+
+V1 simplified repository for vector semantic retrieval. Only stores
+search-essential fields in Qdrant; full data is fetched from MongoDB via
+``parent_id`` back-reference.
+
+Mirrors the surface of the Milvus counterpart for caller parity, but uses
+native Qdrant filtering (``qmodels.Filter(must=[FieldCondition...])``)
+instead of Milvus' string expression syntax.
+"""
+
+import asyncio
+import json
+from datetime import datetime
+from functools import partial
+from typing import Any, Dict, List, Optional
+
+from qdrant_client.http import models as qmodels
+
+from core.di.decorators import repository
+from core.observation.logger import get_logger
+from core.oxm.constants import MAGIC_ALL
+from core.oxm.qdrant.base_repository import BaseQdrantRepository
+from infra_layer.adapters.out.search.qdrant.memory.episodic_memory_collection import (
+    EpisodicMemoryCollection,
+)
+
+logger = get_logger(__name__)
+
+
+@repository("episodic_memory_qdrant_repository", primary=False)
+class EpisodicMemoryQdrantRepository(BaseQdrantRepository[EpisodicMemoryCollection]):
+    """V1 simplified Qdrant repository for episodic memory."""
+
+    def __init__(self) -> None:
+        super().__init__(EpisodicMemoryCollection)
+
+    # ===================================== Document creation / management
+
+    async def create_and_save_episodic_memory(
+        self,
+        id: str,
+        user_id: str,
+        timestamp: datetime,
+        episode: str,
+        search_content: List[str],
+        vector: List[float],
+        title: Optional[str] = None,
+        summary: Optional[str] = None,
+        group_id: Optional[str] = None,
+        participants: Optional[List[str]] = None,
+        sender_ids: Optional[List[str]] = None,
+        event_type: Optional[str] = None,
+        subject: Optional[str] = None,
+        parent_type: Optional[str] = None,
+        parent_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        High-level convenience constructor: build a ``PointStruct`` and upsert.
+
+        Returns:
+            A small summary dict (id, user_id, timestamp, episode,
+            search_content) — same shape as the Milvus repository to keep
+            callers untouched at cutover.
+        """
+        try:
+            payload = {
+                "user_id": user_id or "",
+                "group_id": group_id or "",
+                "session_id": "",  # not provided by this entry point
+                "participants": participants or [],
+                "sender_ids": sender_ids or [],
+                "type": event_type or "",
+                "timestamp": int(timestamp.timestamp() * 1000),
+                "episode": episode,
+                "search_content": json.dumps(search_content, ensure_ascii=False),
+                "parent_type": parent_type or "",
+                "parent_id": parent_id or "",
+            }
+
+            await self.upsert(
+                qmodels.PointStruct(id=id, vector=vector, payload=payload)
+            )
+
+            logger.debug(
+                "Episodic memory point upserted: id=%s, user_id=%s", id, user_id
+            )
+
+            return {
+                "id": id,
+                "user_id": user_id,
+                "timestamp": timestamp,
+                "episode": episode,
+                "search_content": search_content,
+            }
+
+        except Exception as e:
+            logger.error(
+                "Failed to create episodic memory point: id=%s, error=%s", id, e
+            )
+            raise
+
+    # ============================================================ search
+
+    async def vector_search(
+        self,
+        query_vector: List[float],
+        user_id: Optional[str] = None,
+        group_ids: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+        parent_type: Optional[str] = None,
+        parent_id: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        limit: int = 10,
+        score_threshold: float = 0.0,
+        radius: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """Vector similarity search with optional scope + time-range filters."""
+        try:
+            conditions: List[qmodels.FieldCondition] = []
+
+            if user_id != MAGIC_ALL:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="user_id",
+                        match=qmodels.MatchValue(value=user_id or ""),
+                    )
+                )
+
+            if group_ids:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="group_id",
+                        match=qmodels.MatchAny(any=list(group_ids)),
+                    )
+                )
+
+            if session_id:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="session_id",
+                        match=qmodels.MatchValue(value=session_id),
+                    )
+                )
+
+            if parent_type:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="parent_type",
+                        match=qmodels.MatchValue(value=parent_type),
+                    )
+                )
+
+            if parent_id:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="parent_id",
+                        match=qmodels.MatchValue(value=parent_id),
+                    )
+                )
+
+            time_range: Dict[str, int] = {}
+            if start_time:
+                time_range["gte"] = int(start_time.timestamp() * 1000)
+            if end_time:
+                time_range["lte"] = int(end_time.timestamp() * 1000)
+            if time_range:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="timestamp",
+                        range=qmodels.Range(**time_range),
+                    )
+                )
+
+            query_filter = qmodels.Filter(must=conditions) if conditions else None
+            ef_value = max(128, limit * 2)
+            # Two-stage score gating (parity with Milvus repository):
+            #   - ``effective_threshold`` is the wider net passed to Qdrant
+            #     server-side via ``score_threshold`` (``radius`` overrides if
+            #     explicitly set above -1.0; otherwise ``score_threshold``).
+            #   - The client-side ``point.score < score_threshold`` post-filter
+            #     enforces the hard caller-facing minimum, allowing callers
+            #     to widen the recall via ``radius`` while keeping a stricter
+            #     cut-off in the returned list.
+            effective_threshold = (
+                radius if (radius is not None and radius > -1.0) else score_threshold
+            )
+
+            scored_points = await self.search(
+                query_vector=query_vector,
+                limit=limit,
+                query_filter=query_filter,
+                with_payload=True,
+                with_vectors=False,
+                score_threshold=(
+                    effective_threshold if effective_threshold > 0 else None
+                ),
+                search_params=qmodels.SearchParams(hnsw_ef=ef_value),
+            )
+
+            search_results: List[Dict[str, Any]] = []
+            for point in scored_points:
+                if point.score < score_threshold:
+                    continue
+                payload = point.payload or {}
+                search_results.append(
+                    {
+                        "id": str(point.id),
+                        "score": float(point.score),
+                        "user_id": payload.get("user_id"),
+                        "group_id": payload.get("group_id"),
+                        "session_id": payload.get("session_id"),
+                        "participants": payload.get("participants"),
+                        "timestamp": payload.get("timestamp"),
+                        "parent_type": payload.get("parent_type"),
+                        "parent_id": payload.get("parent_id"),
+                        "type": payload.get("type"),
+                        "episode": payload.get("episode"),
+                    }
+                )
+
+            logger.debug(
+                "EpisodicMemory Qdrant search: found %d results", len(search_results)
+            )
+            return search_results
+
+        except Exception as e:
+            logger.error("EpisodicMemory Qdrant search failed: %s", e)
+            raise
+
+    # ========================================================== deletion
+
+    async def delete_by_filters(
+        self,
+        user_id: Optional[str] = MAGIC_ALL,
+        group_id: Optional[str] = MAGIC_ALL,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> int:
+        """
+        Batch delete by filter combination.
+
+        At least one filter (other than ``MAGIC_ALL`` sentinels) must be
+        provided, matching the Milvus repository's guard.
+        """
+        try:
+            conditions: List[qmodels.FieldCondition] = []
+
+            if user_id != MAGIC_ALL:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="user_id",
+                        match=qmodels.MatchValue(value=user_id or ""),
+                    )
+                )
+            if group_id != MAGIC_ALL:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="group_id",
+                        match=qmodels.MatchValue(value=group_id or ""),
+                    )
+                )
+
+            time_range: Dict[str, int] = {}
+            if start_time:
+                time_range["gte"] = int(start_time.timestamp() * 1000)
+            if end_time:
+                time_range["lte"] = int(end_time.timestamp() * 1000)
+            if time_range:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="timestamp",
+                        range=qmodels.Range(**time_range),
+                    )
+                )
+
+            if not conditions:
+                raise ValueError("At least one filter condition must be provided")
+
+            filter_ = qmodels.Filter(must=conditions)
+            client = self.collection.client()
+            name = self.collection.name
+
+            # Count first (Qdrant ``delete(filter=)`` doesn't return a count).
+            scrolled, _ = await asyncio.to_thread(
+                partial(
+                    client.scroll,
+                    collection_name=name,
+                    scroll_filter=filter_,
+                    limit=10_000,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+            )
+            delete_count = len(scrolled)
+
+            if delete_count > 0:
+                await asyncio.to_thread(
+                    partial(
+                        client.delete,
+                        collection_name=name,
+                        points_selector=qmodels.FilterSelector(filter=filter_),
+                        wait=True,
+                    )
+                )
+
+            logger.debug(
+                "Batch deleted episodic memories: deleted %d points", delete_count
+            )
+            return delete_count
+
+        except Exception as e:
+            logger.error("Failed to batch delete episodic memories: %s", e)
+            raise
