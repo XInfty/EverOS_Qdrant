@@ -49,6 +49,14 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+# Standalone CLI: add ``src/`` to sys.path so EverOS-internal modules
+# (``core.oxm.qdrant.base_repository``) resolve when this script is
+# invoked directly with ``python src/devops_scripts/migrate_milvus_to_qdrant.py``
+# (no install / no PYTHONPATH).
+_SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+
 try:
     from dotenv import load_dotenv
 
