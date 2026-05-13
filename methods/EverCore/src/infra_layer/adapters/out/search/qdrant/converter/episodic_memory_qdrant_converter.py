@@ -17,6 +17,7 @@ from qdrant_client.http import models as qmodels
 
 from core.observation.logger import get_logger
 from core.oxm.qdrant.base_converter import BaseQdrantConverter
+from core.oxm.qdrant.base_repository import mongo_id_to_qdrant_id
 from infra_layer.adapters.out.persistence.document.memory.episodic_memory import (
     EpisodicMemory as MongoEpisodicMemory,
 )
@@ -81,6 +82,10 @@ class EpisodicMemoryQdrantConverter(BaseQdrantConverter[EpisodicMemoryCollection
                 "parent_id": (
                     str(source_doc.parent_id) if source_doc.parent_id else ""
                 ),
+                # Mongo back-reference: Qdrant ids are derived via uuid5, so
+                # we keep the raw Mongo id in the payload for round-trip
+                # lookup, idempotent re-embed, and debugging.
+                "mongo_id": str(source_doc.id),
             }
 
             vector = (
@@ -95,7 +100,7 @@ class EpisodicMemoryQdrantConverter(BaseQdrantConverter[EpisodicMemoryCollection
                 )
 
             return qmodels.PointStruct(
-                id=str(source_doc.id),
+                id=mongo_id_to_qdrant_id(source_doc.id),
                 vector=vector,
                 payload=payload,
             )

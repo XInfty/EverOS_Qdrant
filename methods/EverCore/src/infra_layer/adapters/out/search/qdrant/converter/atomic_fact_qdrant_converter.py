@@ -13,6 +13,7 @@ from qdrant_client.http import models as qmodels
 from api_specs.memory_types import RawDataType
 from core.observation.logger import get_logger
 from core.oxm.qdrant.base_converter import BaseQdrantConverter
+from core.oxm.qdrant.base_repository import mongo_id_to_qdrant_id
 from infra_layer.adapters.out.persistence.document.memory.atomic_fact_record import (
     AtomicFactRecord as MongoAtomicFactRecord,
 )
@@ -70,6 +71,8 @@ class AtomicFactQdrantConverter(BaseQdrantConverter[AtomicFactCollection]):
                 # Persist the canonical text so search results can return the
                 # underlying atomic_fact without a Mongo round-trip.
                 "search_content": cls._build_search_content(source_doc),
+                # Mongo back-reference (see episodic_memory converter).
+                "mongo_id": str(source_doc.id),
             }
 
             vector = getattr(source_doc, "vector", None) or None
@@ -80,7 +83,7 @@ class AtomicFactQdrantConverter(BaseQdrantConverter[AtomicFactCollection]):
                 )
 
             return qmodels.PointStruct(
-                id=str(source_doc.id),
+                id=mongo_id_to_qdrant_id(source_doc.id),
                 vector=vector,
                 payload=payload,
             )

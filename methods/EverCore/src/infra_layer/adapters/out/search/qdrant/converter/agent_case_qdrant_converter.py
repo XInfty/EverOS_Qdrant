@@ -10,6 +10,7 @@ from qdrant_client.http import models as qmodels
 
 from core.observation.logger import get_logger
 from core.oxm.qdrant.base_converter import BaseQdrantConverter
+from core.oxm.qdrant.base_repository import mongo_id_to_qdrant_id
 from infra_layer.adapters.out.persistence.document.memory.agent_case import (
     AgentCaseRecord,
 )
@@ -59,10 +60,12 @@ class AgentCaseQdrantConverter(BaseQdrantConverter[AgentCaseCollection]):
                 "task_intent": task_intent[:5000],
                 "parent_type": source_doc.parent_type or "",
                 "parent_id": source_doc.parent_id or "",
+                # Mongo back-reference (see episodic_memory converter).
+                "mongo_id": str(source_doc.id),
             }
 
             return qmodels.PointStruct(
-                id=str(source_doc.id),
+                id=mongo_id_to_qdrant_id(source_doc.id),
                 vector=vector,
                 payload=payload,
             )
