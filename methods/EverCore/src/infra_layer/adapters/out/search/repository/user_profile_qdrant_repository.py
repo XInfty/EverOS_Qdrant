@@ -11,6 +11,7 @@ Note: UserProfile has no ``session_id`` (user-level aggregation).
 
 import asyncio
 from functools import partial
+from hashlib import sha256
 from typing import Any, Dict, List, Optional
 
 from qdrant_client.http import models as qmodels
@@ -27,6 +28,19 @@ from infra_layer.adapters.out.search.qdrant.memory.user_profile_collection impor
 )
 
 logger = get_logger(__name__)
+
+
+def _fp(value: Optional[str]) -> str:
+    """
+    Short fingerprint for log lines. Profile identifiers can be PII when
+    the upstream caller is using human-readable user/group ids; emitting
+    the raw value into centralised logs is an unnecessary compliance risk.
+    A 12-char SHA-256 prefix is enough to correlate events without
+    surfacing the underlying identifier. ``None``/empty becomes ``"-"``.
+    """
+    if not value:
+        return "-"
+    return sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
 @repository("user_profile_qdrant_repository", primary=False)
@@ -166,18 +180,18 @@ class UserProfileQdrantRepository(BaseQdrantRepository[UserProfileCollection]):
                 )
 
             logger.info(
-                "Deleted profile items: user_id=%s, group_id=%s, count=%d",
-                user_id,
-                group_id,
+                "Deleted profile items: user_fp=%s group_fp=%s count=%d",
+                _fp(user_id),
+                _fp(group_id),
                 count,
             )
             return count
 
         except Exception as e:
-            logger.error(
-                "Failed to delete profile items: user_id=%s, group_id=%s, error=%s",
-                user_id,
-                group_id,
+            logger.exception(
+                "Failed to delete profile items: user_fp=%s group_fp=%s error=%s",
+                _fp(user_id),
+                _fp(group_id),
                 e,
             )
             # Re-raise so callers can distinguish "nothing to delete" from

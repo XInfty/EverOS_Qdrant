@@ -75,7 +75,7 @@ class AtomicFactQdrantConverter(BaseQdrantConverter[AtomicFactCollection]):
                 "mongo_id": str(source_doc.id),
             }
 
-            vector = getattr(source_doc, "vector", None) or None
+            vector = getattr(source_doc, "vector", None)
             if not vector:
                 raise ValueError(
                     f"Vector is required for AtomicFactRecord {source_doc.id} "

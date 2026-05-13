@@ -96,6 +96,12 @@ SPECS = {
             "user_id", "group_id", "session_id",
             "participants", "sender_ids", "type",
             "parent_type", "parent_id",
+            # ``AtomicFactQdrantRepository.vector_search`` surfaces the raw
+            # text from ``payload.atomic_fact`` so callers don't need a
+            # Mongo round-trip; the converter writes this field, so the
+            # sweep must persist it too — otherwise migrated records would
+            # come back with ``atomic_fact=None``.
+            "atomic_fact",
         ),
     ),
     "foresight": CollectionSpec(
@@ -202,8 +208,15 @@ def sweep(
     limit_per_pair: Optional[int],
     force: bool,
     dry_run: bool,
-) -> None:
-    """Iterate active DBs × selected specs and run ``migrate`` per non-empty pair."""
+) -> int:
+    """
+    Iterate active DBs × selected specs and run ``migrate`` per non-empty pair.
+
+    Returns:
+        Number of pairs that failed. Callers (cron, CI) propagate this as a
+        non-zero exit code — silent partial-failure sweeps used to be marked
+        green by the previous unconditional ``return 0`` in ``main()``.
+    """
     active_dbs = list_active_dbs(config.mongo_uri)
     if tenant_filter:
         active_dbs = [d for d in active_dbs if d.startswith(tenant_filter)]
@@ -267,6 +280,7 @@ def sweep(
         pairs_run, pairs_skipped_empty, pairs_failed,
         time.time() - overall_start,
     )
+    return pairs_failed
 
 
 # =================================================================== CLI
@@ -310,7 +324,7 @@ def main() -> int:
     )
     config = Config.from_env()
     spec_keys = [args.collection] if args.collection else list(SPECS)
-    sweep(
+    failed = sweep(
         config=config,
         spec_keys=spec_keys,
         tenant_filter=args.tenant,
@@ -319,7 +333,9 @@ def main() -> int:
         force=args.force,
         dry_run=args.dry_run,
     )
-    return 0
+    # Non-zero exit when any pair failed so the surrounding cron / CI run
+    # treats the sweep as failed instead of silently green.
+    return 1 if failed > 0 else 0
 
 
 if __name__ == "__main__":

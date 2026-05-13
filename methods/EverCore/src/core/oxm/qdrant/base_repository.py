@@ -129,18 +129,28 @@ class BaseQdrantRepository(ABC, Generic[T]):
     def __init__(self, model: Type[T]):
         self.model = model
         self.model_name = model.__name__
-        # Lazy: defer Collection instantiation until first use so that the
-        # repository can be constructed in tenant-less contexts (DI scan).
-        self._collection: Optional[T] = None
 
     # ------------------------------------------------------------------ shape
 
     @property
     def collection(self) -> T:
-        """Lazily instantiate the bound ``QdrantCollectionBase`` subclass."""
-        if self._collection is None:
-            self._collection = self.model()
-        return self._collection
+        """
+        Instantiate the bound ``QdrantCollectionBase`` subclass for the
+        **current tenant context**.
+
+        Not cached on the repository instance: the model's ``__init__``
+        resolves the tenant-prefixed collection name at construction time
+        (see ``TenantAwareQdrantCollectionWithSuffix``). With a typical
+        DI singleton repository scope, caching the result would lock the
+        repository to whichever tenant happened to make the first call,
+        which would silently route subsequent tenants' reads and writes to
+        the wrong collection.
+
+        The model construction itself is cheap (a tenant-name lookup plus
+        the base validation in ``QdrantCollectionBase.__init__``), so the
+        per-call cost is negligible compared to the round-trip to Qdrant.
+        """
+        return self.model()
 
     def get_model_name(self) -> str:
         return self.model_name

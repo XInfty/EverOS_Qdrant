@@ -115,12 +115,30 @@ class QdrantLifespanProvider(LifespanProvider):
             logger.info("Qdrant connection initialization completed")
 
         except Exception as e:
+            # Rollback: any clients we managed to construct before the failure
+            # must be closed, otherwise the next startup retry leaks pools.
             logger.error("Error during Qdrant initialization: %s", str(e))
+            try:
+                if self._qdrant_factory is not None:
+                    self._qdrant_factory.close_all_clients()
+            except Exception as rollback_err:  # noqa: BLE001
+                logger.warning(
+                    "Rollback close_all_clients() also failed: %s",
+                    rollback_err,
+                )
+            self._qdrant_clients = {}
             raise
 
     async def shutdown(self, app: FastAPI) -> None:
-        """Close Qdrant connections (No-Op wenn nicht initialisiert)."""
-        if not _backend_is_qdrant() or self._qdrant_factory is None:
+        """
+        Close Qdrant connections (No-Op wenn nicht initialisiert).
+
+        The gate hangs on ``self._qdrant_factory is None``, NOT on the env
+        flag — if the backend env was switched between startup and shutdown
+        (e.g. in a test), we still need to close any clients we actually
+        opened during startup.
+        """
+        if self._qdrant_factory is None:
             return
 
         logger.info("Closing Qdrant connections...")

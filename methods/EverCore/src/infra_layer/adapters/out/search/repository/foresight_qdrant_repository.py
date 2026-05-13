@@ -148,11 +148,18 @@ class ForesightQdrantRepository(BaseQdrantRepository[ForesightCollection]):
         """
         Vector similarity search with scope, sender, and time-range filters.
 
-        Time filters semantic:
-        - ``start_time`` arg -> ``payload.start_time >= start_time_ms`` (only
-          foresights whose window begins at or after the given instant).
-        - ``end_time`` arg -> ``payload.end_time <= end_time_ms`` (only
-          foresights whose window ends at or before the given instant).
+        Time filters semantic — **window-overlap**, not containment. A
+        record matches when its window ``[start_time, end_time]`` overlaps
+        the query window ``[start_time arg, end_time arg]``:
+
+        - ``end_time`` arg -> ``payload.start_time <= end_time_ms`` (record
+          starts on or before the query window ends).
+        - ``start_time`` arg -> ``payload.end_time >= start_time_ms`` (record
+          ends on or after the query window starts).
+
+        The previous containment filter (``start>=q.start AND end<=q.end``)
+        silently dropped foresights whose window only partially overlapped
+        the query window, which is rarely what callers want.
 
         ``sender_id`` filters via Qdrant's array-containment semantics on the
         ``sender_ids`` payload field.
@@ -210,17 +217,20 @@ class ForesightQdrantRepository(BaseQdrantRepository[ForesightCollection]):
                     )
                 )
 
+            # Window-overlap filter (see docstring): a record overlaps the
+            # query window iff record.end_time >= query.start AND
+            # record.start_time <= query.end.
             if start_time:
                 conditions.append(
                     qmodels.FieldCondition(
-                        key="start_time",
+                        key="end_time",
                         range=qmodels.Range(gte=to_epoch_ms(start_time)),
                     )
                 )
             if end_time:
                 conditions.append(
                     qmodels.FieldCondition(
-                        key="end_time",
+                        key="start_time",
                         range=qmodels.Range(lte=to_epoch_ms(end_time)),
                     )
                 )

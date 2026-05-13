@@ -19,9 +19,18 @@
 > ### Approach
 >
 > EverOS' `src/infra_layer/adapters/out/search/` already supports multiple
-> backends (Milvus + Elasticsearch). We add a Qdrant adapter under
-> `src/core/oxm/qdrant/` and route via `VECTOR_STORE_BACKEND=qdrant`. The
-> Milvus adapter stays untouched until cutover.
+> backends (Milvus + Elasticsearch). We add a Qdrant adapter split across:
+>
+> - `src/core/oxm/qdrant/` — base classes (`QdrantCollectionBase`,
+>   `BaseQdrantConverter`, `BaseQdrantRepository`) and tenant-aware naming.
+> - `src/infra_layer/adapters/out/search/qdrant/` — the concrete collections
+>   and converters per memory type (episodic, atomic_fact, foresight,
+>   agent_case, agent_skill, user_profile).
+> - `src/infra_layer/adapters/out/search/repository/` — the
+>   `@repository`-decorated adapters that EverOS routes to.
+>
+> Routing is gated by `VECTOR_STORE_BACKEND=qdrant`. The Milvus adapter
+> stays untouched until cutover.
 >
 > ### Concept Mapping
 >

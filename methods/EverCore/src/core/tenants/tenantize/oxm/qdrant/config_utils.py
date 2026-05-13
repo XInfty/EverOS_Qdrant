@@ -123,6 +123,17 @@ def get_qdrant_connection_cache_key(config: Dict[str, Any]) -> str:
             key_bytes = str(api_key).encode("utf-8")
         endpoint += f"#{sha256(key_bytes).hexdigest()[:8]}"
 
+    # Transport flags must participate in the cache key — two tenants that
+    # share host:port but disagree on ``https`` or ``prefer_grpc`` need
+    # *different* cached clients. Without these in the key, the first
+    # tenant's client config would be reused for the second tenant.
+    https = config.get("https")
+    if https is not None:
+        endpoint += f"#https={bool(https)}"
+    prefer_grpc = config.get("prefer_grpc")
+    if prefer_grpc is not None:
+        endpoint += f"#grpc={bool(prefer_grpc)}"
+
     return endpoint
 
 

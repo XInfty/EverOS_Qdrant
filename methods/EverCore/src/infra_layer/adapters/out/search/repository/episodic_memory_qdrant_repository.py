@@ -228,6 +228,7 @@ class EpisodicMemoryQdrantRepository(BaseQdrantRepository[EpisodicMemoryCollecti
                 if point.score < score_threshold:
                     continue
                 payload = point.payload or {}
+                ts_ms = payload.get("timestamp", 0) or 0
                 search_results.append(
                     {
                         "id": str(point.id),
@@ -236,7 +237,15 @@ class EpisodicMemoryQdrantRepository(BaseQdrantRepository[EpisodicMemoryCollecti
                         "group_id": payload.get("group_id"),
                         "session_id": payload.get("session_id"),
                         "participants": payload.get("participants"),
-                        "timestamp": payload.get("timestamp"),
+                        # Normalise epoch ms back to a UTC ``datetime`` for
+                        # caller parity with the other Qdrant repositories
+                        # (atomic_fact, agent_case, foresight) — they all
+                        # surface time as ``datetime``, returning the raw
+                        # epoch here used to break callers that wanted a
+                        # single time type across collections.
+                        "timestamp": datetime.fromtimestamp(
+                            ts_ms / 1000, tz=timezone.utc
+                        ),
                         "parent_type": payload.get("parent_type"),
                         "parent_id": payload.get("parent_id"),
                         "type": payload.get("type"),
@@ -250,7 +259,7 @@ class EpisodicMemoryQdrantRepository(BaseQdrantRepository[EpisodicMemoryCollecti
             return search_results
 
         except Exception as e:
-            logger.error("EpisodicMemory Qdrant search failed: %s", e)
+            logger.exception("EpisodicMemory Qdrant search failed: %s", e)
             raise
 
     # ========================================================== deletion

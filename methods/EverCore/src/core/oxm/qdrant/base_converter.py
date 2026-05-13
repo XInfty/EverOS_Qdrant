@@ -63,22 +63,28 @@ class BaseQdrantConverter(ABC, Generic[QdrantCollectionType]):
 
     @classmethod
     @abstractmethod
-    def from_mongo(cls, source_doc: Any) -> QdrantCollectionType:
+    def from_mongo(cls, source_doc: Any) -> Any:
         """
         Convert from a data source (typically a Mongo doc) to a Qdrant entity.
 
-        Subclasses must implement specific conversion logic. By Milvus-counterpart
-        convention, the returned value is typically a ``PointStruct`` instance
-        (``id``, ``vector``, ``payload``) or a compatible dict that can be passed
-        to ``client.upsert(collection_name, points=[...])``. The Generic bound
-        documents the *target collection class* rather than the wire payload
-        shape.
+        Subclasses must implement specific conversion logic. The concrete
+        return type is typically a ``qdrant_client.http.models.PointStruct``
+        (``id``, ``vector``, ``payload``) or — for converters that split one
+        source doc into many points (e.g. ``UserProfile``) — a
+        ``List[Dict[str, Any]]`` whose items the indexer wraps into
+        ``PointStruct`` after embedding.
+
+        The annotation is ``Any`` because the generic ``QdrantCollectionType``
+        parameter documents the *target collection class*, not the wire-
+        format the converter emits. Subclasses tighten the annotation
+        ("-> PointStruct" or "-> List[Dict[str, Any]]") as they implement.
 
         Args:
             source_doc: Source data (any type — Mongo doc, dict, etc.).
 
         Returns:
-            A Qdrant point payload bound to ``QdrantCollectionType``.
+            Either a ``PointStruct`` or a ``List[Dict[str, Any]]`` of
+            per-item payload dicts, depending on the subclass.
 
         Raises:
             Exception: When an error occurs during conversion.

@@ -164,6 +164,46 @@ def extract_text(
     return "\n".join(parts).strip()
 
 
+# Heuristic threshold: anything above this is interpreted as epoch
+# milliseconds when the target unit is seconds (and the inverse for ms).
+# ~year 2065 in seconds, ~year 2001 in milliseconds — gives plenty of head
+# room before either branch starts misclassifying real timestamps.
+_NUMERIC_TS_HEURISTIC_MS = 3_000_000_000
+
+
+def _normalize_timestamp_to_epoch(
+    value: Any,
+    target_unit: str,
+    doc_id: Any,
+    field_name: str,
+) -> Optional[int]:
+    """
+    Coerce a timestamp value to integer epoch in ``target_unit`` (``"ms"`` or
+    ``"s"``). ``datetime`` values are exact; numeric values are coerced
+    using the heuristic above (a value larger than ``3e9`` is treated as ms,
+    smaller as seconds — covers any realistic post-1970 timestamp).
+
+    Returns ``None`` for unsupported types and emits a warning so the bad
+    document surfaces.
+    """
+    if hasattr(value, "timestamp"):  # datetime / pandas Timestamp
+        secs = value.timestamp()
+        return int(secs * 1000) if target_unit == "ms" else int(secs)
+    if isinstance(value, (int, float)):
+        n = float(value)
+        # Decide source unit from magnitude.
+        source_is_ms = n >= _NUMERIC_TS_HEURISTIC_MS
+        if target_unit == "ms":
+            return int(n) if source_is_ms else int(n * 1000)
+        # target seconds
+        return int(n // 1000) if source_is_ms else int(n)
+    logger.warning(
+        "Skipping timestamp field '%s' with unexpected type %s for doc %s",
+        field_name, type(value).__name__, doc_id,
+    )
+    return None
+
+
 def build_payload(
     doc: Dict[str, Any],
     payload_fields: Tuple[str, ...],
@@ -180,22 +220,32 @@ def build_payload(
 
     # Timestamp normalization to epoch (the unit is collection-dependent).
     if timestamp_field and timestamp_field in doc:
-        ts_value = doc[timestamp_field]
-        if hasattr(ts_value, "timestamp"):  # datetime
-            secs = ts_value.timestamp()
-            if timestamp_unit == "ms":
-                payload[timestamp_field] = int(secs * 1000)
-            else:
-                payload[timestamp_field] = int(secs)
-        elif isinstance(ts_value, (int, float)):
-            payload[timestamp_field] = int(ts_value)
-        else:
-            # Silent drop would corrupt time-range filters downstream. Surface
-            # the bad doc so callers can decide whether to clean source data.
-            logger.warning(
-                "Skipping timestamp field '%s' with unexpected type %s for doc %s",
-                timestamp_field, type(ts_value).__name__, doc.get("_id"),
+        payload[timestamp_field] = _normalize_timestamp_to_epoch(
+            doc[timestamp_field], timestamp_unit, doc.get("_id"), timestamp_field,
+        )
+        if payload[timestamp_field] is None:
+            payload.pop(timestamp_field, None)
+
+    # Some collections store a second time field in ``payload_fields`` (e.g.
+    # foresight's ``end_time``) that downstream code treats as epoch ms.
+    # Apply the same normalization to it so range filters / payload indexes
+    # don't see a mixed ``datetime`` / numeric / ISO-string population.
+    for field in payload_fields:
+        if field == timestamp_field:
+            continue  # already handled above
+        if field not in payload:
+            continue
+        # Heuristic: only normalize fields that look time-shaped — a
+        # ``datetime`` or a numeric value. Strings (incl. ISO-8601) are
+        # passed through; if a collection needs ISO-string normalization,
+        # that's a per-collection concern, not a generic sweep concern.
+        value = payload[field]
+        if hasattr(value, "timestamp") or isinstance(value, (int, float)):
+            normalized = _normalize_timestamp_to_epoch(
+                value, timestamp_unit, doc.get("_id"), field,
             )
+            if normalized is not None:
+                payload[field] = normalized
 
     # Persist the text used for the embedding for downstream search-result
     # surfaces (matches the Milvus converter's ``search_content`` payload).
@@ -216,9 +266,30 @@ def build_payload(
 def ensure_qdrant_collection(
     client: QdrantClient, name: str, vector_size: int
 ) -> None:
-    """Create the target Qdrant collection if it does not exist yet."""
+    """
+    Create the target Qdrant collection if it does not exist yet.
+
+    Raises:
+        RuntimeError: when a pre-existing collection has a different vector
+            size. Migrating into a dim-mismatched collection would only
+            surface as opaque "vector size mismatch" errors at upsert time
+            (per batch, with no hint at the schema drift cause).
+    """
     if client.collection_exists(name):
-        logger.info("Qdrant collection '%s' already exists — keeping schema", name)
+        existing = client.get_collection(name)
+        existing_size = existing.config.params.vectors.size  # type: ignore[union-attr]
+        if existing_size != vector_size:
+            raise RuntimeError(
+                f"Qdrant collection '{name}' exists with vector size "
+                f"{existing_size}, but this migration expects {vector_size}. "
+                "Aborting before the per-batch dim-mismatch errors. Either "
+                "set VECTORIZE_DIMENSIONS to match, or rename/delete the "
+                "stale collection."
+            )
+        logger.info(
+            "Qdrant collection '%s' already exists (size=%d) — keeping schema",
+            name, existing_size,
+        )
         return
 
     logger.info(

@@ -90,6 +90,16 @@ def get_qdrant_config(prefix: str = "") -> dict:
     except (TypeError, ValueError):
         logger.warning("Invalid QDRANT_TIMEOUT value — falling back to 30")
         timeout = 30
+    # Range-guard: 0 / negative / extreme values would either disable
+    # timeouts entirely or starve the SDK. Clamp to a sane window so a typo
+    # in the env doesn't produce silent multi-hour hangs or instant fails.
+    _TIMEOUT_MIN, _TIMEOUT_MAX = 1, 300
+    if not _TIMEOUT_MIN <= timeout <= _TIMEOUT_MAX:
+        logger.warning(
+            "QDRANT_TIMEOUT=%d outside [%d, %d] — clamping",
+            timeout, _TIMEOUT_MIN, _TIMEOUT_MAX,
+        )
+        timeout = max(_TIMEOUT_MIN, min(timeout, _TIMEOUT_MAX))
 
     # URL-Assembly. If host already carries a scheme/port, take it verbatim — the
     # caller has explicitly chosen what to connect to. Otherwise build the URL

@@ -186,18 +186,20 @@ class QdrantCollectionBase:
         """
         Return True if the underlying Qdrant collection already exists.
 
-        Only the known qdrant-client transport-level exceptions are caught
-        (``ResponseHandlingException`` for connection/timeout errors,
-        ``UnexpectedResponse`` for 4xx/5xx HTTP responses). Anything else —
-        including configuration errors, auth failures surfaced as different
-        exception types, or programming bugs — is allowed to propagate so
-        infrastructure problems stay visible.
+        Only transport-level errors (``ResponseHandlingException`` — connect
+        refused, timeout, DNS failure) are caught and reported as "does not
+        exist". HTTP error responses (``UnexpectedResponse`` for 4xx/5xx,
+        including 401/403 auth failures and 5xx server errors) propagate —
+        treating them as "not exists" would route a downstream
+        ``ensure_collection()`` into a confusing follow-up create attempt
+        and bury the real cause (e.g. invalid API key, server down).
         """
         try:
             return self.client().collection_exists(self.name)
-        except (ResponseHandlingException, UnexpectedResponse) as e:
+        except ResponseHandlingException as e:
             logger.warning(
-                "collection_exists('%s') failed: %s — treating as non-existent",
+                "collection_exists('%s') failed at transport level: %s — "
+                "treating as non-existent",
                 self.name,
                 e,
             )
@@ -216,13 +218,6 @@ class QdrantCollectionBase:
         schema differs from ``_VECTOR_PARAMS`` — schema migration is an
         explicit external concern.
         """
-        if self.exists():
-            logger.debug(
-                "Qdrant collection '%s' already exists, skipping create",
-                self.name,
-            )
-            return
-
         cfg = self._VECTOR_PARAMS
         # ``__init__`` already enforces this — explicit check guards against
         # subclasses that override ``__init__`` without invoking ``super``,
@@ -231,6 +226,36 @@ class QdrantCollectionBase:
             raise RuntimeError(
                 f"{self.__class__.__name__}._VECTOR_PARAMS is None"
             )
+
+        if self.exists():
+            # Validate dimension parity: a pre-existing collection with a
+            # different vector size would only surface as opaque "vector
+            # size mismatch" errors per upsert/search later. Fail loud here
+            # instead so the operator notices a stale schema before data
+            # corruption accumulates.
+            try:
+                existing = self.client().get_collection(self.name)
+                existing_size = (
+                    existing.config.params.vectors.size  # type: ignore[union-attr]
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    "get_collection('%s') failed during dim-validation: %s",
+                    self.name, e,
+                )
+                existing_size = None
+            if existing_size is not None and existing_size != cfg.size:
+                raise RuntimeError(
+                    f"Qdrant collection '{self.name}' exists with vector "
+                    f"size {existing_size}, but {self.__class__.__name__} "
+                    f"expects {cfg.size}. Migrate or rename the collection."
+                )
+            logger.debug(
+                "Qdrant collection '%s' already exists, skipping create",
+                self.name,
+            )
+            return
+
         logger.info(
             "Creating Qdrant collection '%s' (size=%d, distance=%s, on_disk=%s)",
             self.name,
@@ -238,10 +263,25 @@ class QdrantCollectionBase:
             cfg.distance,
             cfg.on_disk,
         )
-        self.client().create_collection(
-            collection_name=self.name,
-            vectors_config=cfg.to_vectors_config(),
-        )
+        try:
+            self.client().create_collection(
+                collection_name=self.name,
+                vectors_config=cfg.to_vectors_config(),
+            )
+        except UnexpectedResponse as e:
+            # TOCTOU between ``self.exists()`` and ``create_collection``: a
+            # parallel process (sibling adapter, second ``ensure_all`` call
+            # during a race) may have created the collection just now.
+            # Qdrant returns 409 Conflict; swallow it and verify the
+            # already-existing collection matches our schema, then continue.
+            if getattr(e, "status_code", None) == 409:
+                logger.info(
+                    "Qdrant collection '%s' was created concurrently — "
+                    "treating create as idempotent",
+                    self.name,
+                )
+            else:
+                raise
 
     def ensure_payload_indexes(self) -> None:
         """
@@ -252,7 +292,13 @@ class QdrantCollectionBase:
         so we call it unconditionally per field.
         """
         cfg = self._VECTOR_PARAMS
-        assert cfg is not None
+        # Explicit guard instead of ``assert`` — stripped under ``python -O``,
+        # which would leave the ``cfg.payload_indexes`` access below to raise
+        # an opaque ``AttributeError`` in production builds.
+        if cfg is None:
+            raise RuntimeError(
+                f"{self.__class__.__name__}._VECTOR_PARAMS is None"
+            )
         if not cfg.payload_indexes:
             logger.debug(
                 "Qdrant collection '%s' has no declared payload indexes, skipping",
