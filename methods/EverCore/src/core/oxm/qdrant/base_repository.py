@@ -15,6 +15,7 @@ so we keep the same async repository surface as the Milvus counterpart.
 
 import asyncio
 from abc import ABC
+from datetime import datetime, timezone
 from typing import Any, Generic, List, Optional, Type, TypeVar
 
 from qdrant_client.http import models as qmodels
@@ -25,6 +26,26 @@ from core.oxm.qdrant.qdrant_collection_base import QdrantCollectionBase
 logger = get_logger(__name__)
 
 T = TypeVar("T", bound=QdrantCollectionBase)
+
+
+def to_epoch_ms(dt: datetime) -> int:
+    """
+    Convert a ``datetime`` to epoch milliseconds.
+
+    Naive datetimes (``tzinfo is None``) are interpreted as UTC. Callers that
+    operate in a local timezone should attach an explicit tzinfo before
+    handing the datetime to repository methods to avoid silent drift.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def to_epoch_s(dt: datetime) -> int:
+    """Same as :func:`to_epoch_ms` but in seconds (used by ``agent_case``)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
 
 
 class BaseQdrantRepository(ABC, Generic[T]):
@@ -261,4 +282,12 @@ class BaseQdrantRepository(ABC, Generic[T]):
 
     async def count(self, exact: bool = True) -> int:
         """Number of points in the underlying collection."""
-        return await asyncio.to_thread(self.collection.count, exact)
+        try:
+            result = await asyncio.to_thread(self.collection.count, exact)
+        except Exception as e:
+            logger.error("Qdrant count failed [%s]: %s", self.model_name, e)
+            raise
+        logger.debug(
+            "Qdrant count successful [%s]: %d points", self.model_name, result
+        )
+        return result

@@ -25,7 +25,7 @@ from qdrant_client.http import models as qmodels
 from core.di.decorators import repository
 from core.observation.logger import get_logger
 from core.oxm.constants import MAGIC_ALL
-from core.oxm.qdrant.base_repository import BaseQdrantRepository
+from core.oxm.qdrant.base_repository import BaseQdrantRepository, to_epoch_ms
 from infra_layer.adapters.out.search.qdrant.memory.atomic_fact_collection import (
     AtomicFactCollection,
 )
@@ -64,7 +64,9 @@ class AtomicFactQdrantRepository(BaseQdrantRepository[AtomicFactCollection]):
             Summary dict (id / user_id / atomic_fact / parent_* / timestamp /
             search_content) — same shape as the Milvus repository.
         """
-        if not vector:
+        # Explicit None / empty check so a legitimate all-zero embedding
+        # is not falsy-rejected (any() on a list of 0.0s is False).
+        if vector is None or len(vector) == 0:
             raise ValueError(
                 f"Vector is required for AtomicFact {id} but was not populated"
             )
@@ -80,7 +82,7 @@ class AtomicFactQdrantRepository(BaseQdrantRepository[AtomicFactCollection]):
                 "participants": participants or [],
                 "sender_ids": sender_ids or [],
                 "type": event_type,
-                "timestamp": int(timestamp.timestamp() * 1000),
+                "timestamp": to_epoch_ms(timestamp),
                 "atomic_fact": atomic_fact,
                 "search_content": json.dumps(search_content, ensure_ascii=False),
                 "parent_type": parent_type,
@@ -173,9 +175,9 @@ class AtomicFactQdrantRepository(BaseQdrantRepository[AtomicFactCollection]):
 
             time_range: Dict[str, int] = {}
             if start_time:
-                time_range["gte"] = int(start_time.timestamp() * 1000)
+                time_range["gte"] = to_epoch_ms(start_time)
             if end_time:
-                time_range["lte"] = int(end_time.timestamp() * 1000)
+                time_range["lte"] = to_epoch_ms(end_time)
             if time_range:
                 conditions.append(
                     qmodels.FieldCondition(
@@ -356,9 +358,9 @@ class AtomicFactQdrantRepository(BaseQdrantRepository[AtomicFactCollection]):
 
             time_range: Dict[str, int] = {}
             if start_time:
-                time_range["gte"] = int(start_time.timestamp() * 1000)
+                time_range["gte"] = to_epoch_ms(start_time)
             if end_time:
-                time_range["lte"] = int(end_time.timestamp() * 1000)
+                time_range["lte"] = to_epoch_ms(end_time)
             if time_range:
                 conditions.append(
                     qmodels.FieldCondition(

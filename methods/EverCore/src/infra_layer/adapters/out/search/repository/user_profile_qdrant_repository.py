@@ -57,7 +57,7 @@ class UserProfileQdrantRepository(BaseQdrantRepository[UserProfileCollection]):
                     )
                 )
 
-            if group_id:
+            if group_id and group_id != MAGIC_ALL:
                 conditions.append(
                     qmodels.FieldCondition(
                         key="group_id",
@@ -65,7 +65,7 @@ class UserProfileQdrantRepository(BaseQdrantRepository[UserProfileCollection]):
                     )
                 )
 
-            if scenario:
+            if scenario and scenario != MAGIC_ALL:
                 conditions.append(
                     qmodels.FieldCondition(
                         key="scenario",
