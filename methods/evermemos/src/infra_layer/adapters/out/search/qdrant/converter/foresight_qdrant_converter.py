@@ -17,6 +17,7 @@ from qdrant_client.http import models as qmodels
 
 from core.observation.logger import get_logger
 from core.oxm.qdrant.base_converter import BaseQdrantConverter
+from core.oxm.qdrant.base_repository import mongo_id_to_qdrant_id
 from infra_layer.adapters.out.persistence.document.memory.foresight_record import (
     ForesightRecord as MongoForesightRecord,
 )
@@ -118,6 +119,8 @@ class ForesightQdrantConverter(BaseQdrantConverter[ForesightCollection]):
                 "parent_id": (
                     str(source_doc.parent_id) if source_doc.parent_id else ""
                 ),
+                # Mongo back-reference (see episodic_memory converter).
+                "mongo_id": str(source_doc.id),
             }
 
             vector = source_doc.vector if source_doc.vector else None
@@ -128,7 +131,7 @@ class ForesightQdrantConverter(BaseQdrantConverter[ForesightCollection]):
                 )
 
             return qmodels.PointStruct(
-                id=str(source_doc.id),
+                id=mongo_id_to_qdrant_id(source_doc.id),
                 vector=vector,
                 payload=payload,
             )
