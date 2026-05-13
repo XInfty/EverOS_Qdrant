@@ -24,7 +24,7 @@ from qdrant_client.http import models as qmodels
 from core.di.decorators import repository
 from core.observation.logger import get_logger
 from core.oxm.constants import MAGIC_ALL
-from core.oxm.qdrant.base_repository import BaseQdrantRepository
+from core.oxm.qdrant.base_repository import BaseQdrantRepository, to_epoch_ms
 from infra_layer.adapters.out.search.qdrant.memory.foresight_collection import (
     ForesightCollection,
 )
@@ -88,10 +88,11 @@ class ForesightQdrantRepository(BaseQdrantRepository[ForesightCollection]):
                 "participants": participants or [],
                 "sender_ids": sender_ids or [],
                 "type": event_type,
-                "start_time": (
-                    int(start_time.timestamp() * 1000) if start_time else 0
-                ),
-                "end_time": int(end_time.timestamp() * 1000) if end_time else 0,
+                # ``None`` (not 0) for missing bounds so range queries treat
+                # "no start/end" distinct from "epoch 1970". Downstream
+                # filters skip the field when payload value is None.
+                "start_time": to_epoch_ms(start_time) if start_time else None,
+                "end_time": to_epoch_ms(end_time) if end_time else None,
                 "duration_days": duration_days or 0,
                 "content": content,
                 "evidence": evidence or "",
@@ -209,14 +210,14 @@ class ForesightQdrantRepository(BaseQdrantRepository[ForesightCollection]):
                 conditions.append(
                     qmodels.FieldCondition(
                         key="start_time",
-                        range=qmodels.Range(gte=int(start_time.timestamp() * 1000)),
+                        range=qmodels.Range(gte=to_epoch_ms(start_time)),
                     )
                 )
             if end_time:
                 conditions.append(
                     qmodels.FieldCondition(
                         key="end_time",
-                        range=qmodels.Range(lte=int(end_time.timestamp() * 1000)),
+                        range=qmodels.Range(lte=to_epoch_ms(end_time)),
                     )
                 )
 
@@ -307,14 +308,14 @@ class ForesightQdrantRepository(BaseQdrantRepository[ForesightCollection]):
                 conditions.append(
                     qmodels.FieldCondition(
                         key="start_time",
-                        range=qmodels.Range(gte=int(start_time.timestamp() * 1000)),
+                        range=qmodels.Range(gte=to_epoch_ms(start_time)),
                     )
                 )
             if end_time:
                 conditions.append(
                     qmodels.FieldCondition(
                         key="end_time",
-                        range=qmodels.Range(lte=int(end_time.timestamp() * 1000)),
+                        range=qmodels.Range(lte=to_epoch_ms(end_time)),
                     )
                 )
 

@@ -17,7 +17,7 @@ from qdrant_client.http import models as qmodels
 from core.di.decorators import repository
 from core.observation.logger import get_logger
 from core.oxm.constants import MAGIC_ALL
-from core.oxm.qdrant.base_repository import BaseQdrantRepository
+from core.oxm.qdrant.base_repository import BaseQdrantRepository, to_epoch_s
 from infra_layer.adapters.out.search.qdrant.memory.agent_case_collection import (
     AgentCaseCollection,
 )
@@ -83,11 +83,13 @@ class AgentCaseQdrantRepository(BaseQdrantRepository[AgentCaseCollection]):
                 )
 
             # AgentCase timestamps are epoch SECONDS (Milvus parity).
+            # to_epoch_s coerces tz-naive datetimes to UTC to avoid silent
+            # locale drift in the filter bounds.
             time_range: Dict[str, int] = {}
             if start_time:
-                time_range["gte"] = int(start_time.timestamp())
+                time_range["gte"] = to_epoch_s(start_time)
             if end_time:
-                time_range["lte"] = int(end_time.timestamp())
+                time_range["lte"] = to_epoch_s(end_time)
             if time_range:
                 conditions.append(
                     qmodels.FieldCondition(
