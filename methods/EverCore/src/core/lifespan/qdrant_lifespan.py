@@ -13,6 +13,7 @@ So kann der Adapter-Layer im Repo liegen, ohne dass er aktiv eingreift bis
 zum Cutover.
 """
 
+import asyncio
 import os
 from collections import defaultdict
 from typing import Any, Dict, List, Type
@@ -90,21 +91,29 @@ class QdrantLifespanProvider(LifespanProvider):
                 )
 
             # Pro using: Client holen + Collections initialisieren.
+            # ``get_named_client`` and ``collection.ensure_all`` perform
+            # blocking Qdrant I/O; offload them to a worker thread so the
+            # event loop stays responsive during startup. (``ensure_all`` is
+            # now an async method on ``QdrantCollectionBase``, so it is
+            # awaited directly; the to_thread wrap is only needed for the
+            # synchronous client-factory call.)
             for using, collection_classes in using_collections.items():
-                client = self._qdrant_factory.get_named_client(using)
+                client = await asyncio.to_thread(
+                    self._qdrant_factory.get_named_client, using
+                )
                 self._qdrant_clients[using] = client
 
                 for collection_class in collection_classes:
                     try:
                         collection = collection_class()
-                        collection.ensure_all()
+                        await collection.ensure_all()
                         logger.info(
                             "Qdrant Collection '%s' initialized [using=%s]",
                             collection.name,
                             using,
                         )
                     except Exception as e:
-                        logger.error(
+                        logger.exception(
                             "Failed to initialize Qdrant Collection '%s' [using=%s]: %s",
                             collection_class._COLLECTION_NAME,
                             using,

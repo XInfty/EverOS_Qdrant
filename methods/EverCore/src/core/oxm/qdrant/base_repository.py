@@ -176,13 +176,13 @@ class BaseQdrantRepository(ABC, Generic[T]):
         ``status == completed``) should use ``upsert_batch([point])``.
         """
         try:
-            await asyncio.to_thread(self.collection.upsert, [point], wait)
+            await self.collection.upsert([point], wait)
             logger.debug(
                 "Qdrant upsert successful [%s]: %s", self.model_name, point.id
             )
             return str(point.id)
         except Exception as e:
-            logger.error("Qdrant upsert failed [%s]: %s", self.model_name, e)
+            logger.exception("Qdrant upsert failed [%s]: %s", self.model_name, e)
             raise
 
     async def upsert_batch(
@@ -192,7 +192,7 @@ class BaseQdrantRepository(ABC, Generic[T]):
     ) -> qmodels.UpdateResult:
         """Batch upsert. ``wait=True`` blocks until the operation is durable."""
         try:
-            result = await asyncio.to_thread(self.collection.upsert, points, wait)
+            result = await self.collection.upsert(points, wait)
             logger.debug(
                 "Qdrant batch upsert successful [%s]: %d points",
                 self.model_name,
@@ -200,7 +200,7 @@ class BaseQdrantRepository(ABC, Generic[T]):
             )
             return result
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Qdrant batch upsert failed [%s]: %s", self.model_name, e
             )
             raise
@@ -280,9 +280,9 @@ class BaseQdrantRepository(ABC, Generic[T]):
         for caller-parity with the Milvus repository.
         """
         try:
-            await asyncio.to_thread(self.collection.delete, [point_id], wait)
+            await self.collection.delete([point_id], wait)
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Qdrant delete failed [%s, id=%s]: %s",
                 self.model_name,
                 point_id,
@@ -301,9 +301,7 @@ class BaseQdrantRepository(ABC, Generic[T]):
     ) -> qmodels.UpdateResult:
         """Batch delete by ids."""
         try:
-            result = await asyncio.to_thread(
-                self.collection.delete, point_ids, wait
-            )
+            result = await self.collection.delete(point_ids, wait)
             logger.debug(
                 "Qdrant batch delete successful [%s]: %d ids",
                 self.model_name,
@@ -311,7 +309,7 @@ class BaseQdrantRepository(ABC, Generic[T]):
             )
             return result
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Qdrant batch delete failed [%s, %d ids]: %s",
                 self.model_name,
                 len(point_ids),
@@ -333,8 +331,7 @@ class BaseQdrantRepository(ABC, Generic[T]):
     ) -> List[qmodels.ScoredPoint]:
         """ANN search with optional payload-filter."""
         try:
-            return await asyncio.to_thread(
-                self.collection.search,
+            return await self.collection.search(
                 query_vector,
                 limit,
                 query_filter,
@@ -344,7 +341,7 @@ class BaseQdrantRepository(ABC, Generic[T]):
                 **kwargs,
             )
         except Exception as e:
-            logger.error(
+            logger.exception(
                 "Qdrant search failed [%s, limit=%d]: %s",
                 self.model_name,
                 limit,
@@ -355,9 +352,9 @@ class BaseQdrantRepository(ABC, Generic[T]):
     async def count(self, exact: bool = True) -> int:
         """Number of points in the underlying collection."""
         try:
-            result = await asyncio.to_thread(self.collection.count, exact)
+            result = await self.collection.count(exact)
         except Exception as e:
-            logger.error("Qdrant count failed [%s]: %s", self.model_name, e)
+            logger.exception("Qdrant count failed [%s]: %s", self.model_name, e)
             raise
         logger.debug(
             "Qdrant count successful [%s]: %d points", self.model_name, result

@@ -70,6 +70,9 @@ class CollectionSpec:
     timestamp_field: Optional[str] = "timestamp"
     timestamp_unit: str = "ms"
     payload_fields: Tuple[str, ...] = field(default_factory=tuple)
+    # Additional payload field names that should be epoch-normalized
+    # alongside ``timestamp_field`` (e.g. foresight's ``end_time``).
+    extra_timestamp_fields: Tuple[str, ...] = ()
 
 
 SPECS = {
@@ -110,11 +113,12 @@ SPECS = {
         text_field="content",
         extra_text_fields=("evidence",),
         # Foresight stores start_time / end_time (epoch ms). For the sweep
-        # we use start_time as the time-axis filter (most common range
-        # query semantics). end_time is preserved in the payload but not
-        # indexed by the migrate workhorse (Qdrant collection is built
-        # without payload indexes here — the EverOS service creates them
-        # via ensure_payload_indexes when it first attaches).
+        # we use start_time as the primary time-axis filter (most common
+        # range query semantics). ``end_time`` is normalized via the
+        # ``extra_timestamp_fields`` whitelist below so the foresight
+        # repository's overlap filter can use a consistent epoch-ms type
+        # on both ends. ``duration_days`` is NOT in the whitelist — it is
+        # a non-time numeric field that must stay verbatim.
         timestamp_field="start_time",
         timestamp_unit="ms",
         payload_fields=(
@@ -123,6 +127,7 @@ SPECS = {
             "start_time", "end_time", "duration_days",
             "parent_type", "parent_id",
         ),
+        extra_timestamp_fields=("end_time",),
     ),
     "agent_case": CollectionSpec(
         mongo_collection="v1_agent_cases",
@@ -173,28 +178,20 @@ def derive_tenant_prefix(mongo_db: str) -> str:
     return stripped
 
 
-def list_active_dbs(mongo_uri: str) -> List[str]:
+def list_active_dbs(client: MongoClient) -> List[str]:
     """All non-system DBs whose name has no hyphen (hyphen = abandoned generation)."""
-    client = MongoClient(mongo_uri)
-    try:
-        result = client.admin.command({"listDatabases": 1})
-        return sorted(
-            d["name"]
-            for d in result["databases"]
-            if d["name"] not in ("admin", "config", "local")
-            and "-" not in d["name"]
-        )
-    finally:
-        client.close()
+    result = client.admin.command({"listDatabases": 1})
+    return sorted(
+        d["name"]
+        for d in result["databases"]
+        if d["name"] not in ("admin", "config", "local")
+        and "-" not in d["name"]
+    )
 
 
-def estimated_count(mongo_uri: str, db_name: str, coll_name: str) -> int:
+def estimated_count(client: MongoClient, db_name: str, coll_name: str) -> int:
     """Cheap ``estimatedDocumentCount``; returns 0 if collection is absent."""
-    client = MongoClient(mongo_uri)
-    try:
-        return client[db_name][coll_name].estimated_document_count()
-    finally:
-        client.close()
+    return client[db_name][coll_name].estimated_document_count()
 
 
 # =============================================================== Sweep loop
@@ -217,70 +214,82 @@ def sweep(
         non-zero exit code — silent partial-failure sweeps used to be marked
         green by the previous unconditional ``return 0`` in ``main()``.
     """
-    active_dbs = list_active_dbs(config.mongo_uri)
-    if tenant_filter:
-        active_dbs = [d for d in active_dbs if d.startswith(tenant_filter)]
+    # Single shared Mongo client for the discovery / count phase. The
+    # workhorse ``migrate()`` opens its own connection inside its try/finally
+    # block — that is intentional (each pair is self-contained and survives
+    # cleanup independently). Before this consolidation, ``list_active_dbs``
+    # and ``estimated_count`` each opened and closed their own client per
+    # call, producing N×M connection churn for the discovery scan alone.
+    mongo = MongoClient(config.mongo_uri)
+    try:
+        active_dbs = list_active_dbs(mongo)
+        if tenant_filter:
+            active_dbs = [d for d in active_dbs if d.startswith(tenant_filter)]
 
-    target_specs = {k: SPECS[k] for k in spec_keys}
+        target_specs = {k: SPECS[k] for k in spec_keys}
 
-    logger.info(
-        "Sweep plan: %d active DBs × %d collection types -> up to %d pairs"
-        " (dry_run=%s, batch=%d, limit_per_pair=%s, force=%s)",
-        len(active_dbs), len(target_specs),
-        len(active_dbs) * len(target_specs),
-        dry_run, batch_size, limit_per_pair, force,
-    )
+        logger.info(
+            "Sweep plan: %d active DBs × %d collection types -> up to %d pairs"
+            " (dry_run=%s, batch=%d, limit_per_pair=%s, force=%s)",
+            len(active_dbs), len(target_specs),
+            len(active_dbs) * len(target_specs),
+            dry_run, batch_size, limit_per_pair, force,
+        )
 
-    overall_start = time.time()
-    pairs_run = 0
-    pairs_skipped_empty = 0
-    pairs_failed = 0
+        overall_start = time.time()
+        pairs_run = 0
+        pairs_skipped_empty = 0
+        pairs_failed = 0
 
-    for db in active_dbs:
-        prefix = derive_tenant_prefix(db)
-        for spec_name, spec in target_specs.items():
-            count = estimated_count(
-                config.mongo_uri, db, spec.mongo_collection
-            )
-            if count == 0:
-                pairs_skipped_empty += 1
-                continue
+        for db in active_dbs:
+            prefix = derive_tenant_prefix(db)
+            for spec_name, spec in target_specs.items():
+                count = estimated_count(mongo, db, spec.mongo_collection)
+                if count == 0:
+                    pairs_skipped_empty += 1
+                    continue
 
-            qdrant_coll = f"{prefix}_{spec.qdrant_base}"
-            logger.info(
-                "==> [%s] %s.%s -> %s (count=%d)",
-                spec_name, db, spec.mongo_collection, qdrant_coll, count,
-            )
-            try:
-                migrate(
-                    config=config,
-                    mongo_db=db,
-                    mongo_coll=spec.mongo_collection,
-                    qdrant_coll=qdrant_coll,
-                    text_field=spec.text_field,
-                    extra_text_fields=spec.extra_text_fields,
-                    timestamp_field=spec.timestamp_field,
-                    timestamp_unit=spec.timestamp_unit,
-                    payload_fields=spec.payload_fields,
-                    batch_size=batch_size,
-                    limit=limit_per_pair,
-                    force=force,
-                    dry_run=dry_run,
+                qdrant_coll = f"{prefix}_{spec.qdrant_base}"
+                logger.info(
+                    "==> [%s] %s.%s -> %s (count=%d)",
+                    spec_name, db, spec.mongo_collection, qdrant_coll, count,
                 )
-                pairs_run += 1
-            except Exception as e:
-                logger.exception(
-                    "Pair %s.%s -> %s FAILED: %s",
-                    db, spec.mongo_collection, qdrant_coll, e,
-                )
-                pairs_failed += 1
+                try:
+                    migrate(
+                        config=config,
+                        mongo_db=db,
+                        mongo_coll=spec.mongo_collection,
+                        qdrant_coll=qdrant_coll,
+                        text_field=spec.text_field,
+                        extra_text_fields=spec.extra_text_fields,
+                        timestamp_field=spec.timestamp_field,
+                        timestamp_unit=spec.timestamp_unit,
+                        payload_fields=spec.payload_fields,
+                        extra_timestamp_fields=spec.extra_timestamp_fields,
+                        batch_size=batch_size,
+                        limit=limit_per_pair,
+                        force=force,
+                        dry_run=dry_run,
+                    )
+                    pairs_run += 1
+                except Exception as e:
+                    logger.exception(
+                        "Pair %s.%s -> %s FAILED: %s",
+                        db, spec.mongo_collection, qdrant_coll, e,
+                    )
+                    pairs_failed += 1
 
-    logger.info(
-        "SWEEP DONE: pairs_run=%d pairs_skipped_empty=%d pairs_failed=%d elapsed=%.1fs",
-        pairs_run, pairs_skipped_empty, pairs_failed,
-        time.time() - overall_start,
-    )
-    return pairs_failed
+        logger.info(
+            "SWEEP DONE: pairs_run=%d pairs_skipped_empty=%d pairs_failed=%d elapsed=%.1fs",
+            pairs_run, pairs_skipped_empty, pairs_failed,
+            time.time() - overall_start,
+        )
+        return pairs_failed
+    finally:
+        try:
+            mongo.close()
+        except Exception:  # noqa: BLE001
+            logger.debug("mongo.close() raised during sweep cleanup", exc_info=True)
 
 
 # =================================================================== CLI

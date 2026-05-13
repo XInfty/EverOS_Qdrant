@@ -37,11 +37,17 @@ def get_tenant_qdrant_config() -> Optional[Dict[str, Any]]:
     # Lazy import vermeidet Circular-Dependency bei Adapter-Discovery-Time.
     from core.tenants.tenantize.tenant_context import get_current_tenant
 
-    try:
-        tenant_info = get_current_tenant()
-        if not tenant_info:
-            return None
+    # Fail-closed: an unexpected error during tenant resolution must not
+    # degrade silently to the shared base-prefix path — that would route a
+    # tenant's data into another tenant's collection. Only the specific,
+    # expected ``LookupError`` from ``get_current_tenant()`` / a missing
+    # storage entry is treated as "no tenant config" (return ``None``);
+    # everything else propagates so the caller sees the real error.
+    tenant_info = get_current_tenant()
+    if not tenant_info:
+        return None
 
+    try:
         qdrant_cfg = tenant_info.get_storage_info("qdrant")
         if qdrant_cfg:
             return qdrant_cfg
@@ -52,9 +58,14 @@ def get_tenant_qdrant_config() -> Optional[Dict[str, Any]]:
         return tenant_info.get_storage_info("milvus") or tenant_info.get_storage_info(
             "milvus_config"
         )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Failed to resolve tenant qdrant config: %s", e)
+    except LookupError:
+        # "No such storage entry" is a normal "no tenant config" signal.
         return None
+    except Exception:
+        logger.exception(
+            "Tenant qdrant config resolution failed unexpectedly"
+        )
+        raise
 
 
 def _base_prefixed_collection_name(original_name: str) -> str:
@@ -76,20 +87,16 @@ def get_tenant_aware_collection_name(original_name: str) -> str:
         Tenant-prefixed name (e.g., ``"acme_v1_episodic_memory"``,
         ``"s0001_v1_episodic_memory"``, etc.).
     """
-    try:
-        cfg = get_tenant_qdrant_config()
-        if cfg and cfg.get("collection_prefix"):
-            return f"{cfg['collection_prefix']}_{original_name}"
-
-        # Kein expliziter Prefix im Tenant-Context — Fall back to base resource.
-        return _base_prefixed_collection_name(original_name)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "Failed to resolve tenant-aware Qdrant collection name for '%s': %s",
-            original_name,
-            e,
-        )
-        return _base_prefixed_collection_name(original_name)
+    # Fail-closed: ``get_tenant_qdrant_config`` already returns ``None``
+    # for the "no tenant context" case and re-raises everything else, so
+    # we propagate real resolution failures here too. The base-prefix
+    # fallback only kicks in when the tenant exists but has no explicit
+    # collection_prefix configured — that's a legitimate global-resource
+    # case, not a swallowed error.
+    cfg = get_tenant_qdrant_config()
+    if cfg and cfg.get("collection_prefix"):
+        return f"{cfg['collection_prefix']}_{original_name}"
+    return _base_prefixed_collection_name(original_name)
 
 
 def get_qdrant_connection_cache_key(config: Dict[str, Any]) -> str:
@@ -125,16 +132,32 @@ def get_qdrant_connection_cache_key(config: Dict[str, Any]) -> str:
 
     # Transport flags must participate in the cache key — two tenants that
     # share host:port but disagree on ``https`` or ``prefer_grpc`` need
-    # *different* cached clients. Without these in the key, the first
-    # tenant's client config would be reused for the second tenant.
+    # *different* cached clients. ``bool("false")`` evaluates to ``True``
+    # in Python, so when these flags arrive as strings from a tenant-storage
+    # entry we must parse them as real booleans before keying.
     https = config.get("https")
     if https is not None:
-        endpoint += f"#https={bool(https)}"
+        endpoint += f"#https={_as_bool(https)}"
     prefer_grpc = config.get("prefer_grpc")
     if prefer_grpc is not None:
-        endpoint += f"#grpc={bool(prefer_grpc)}"
+        endpoint += f"#grpc={_as_bool(prefer_grpc)}"
 
     return endpoint
+
+
+def _as_bool(value: Any) -> bool:
+    """
+    Robustly coerce a config value to ``bool``.
+
+    Strings are parsed against the common truthy markers; anything else
+    delegates to ``bool()``. Avoids the ``bool("false") == True`` trap that
+    bit the previous version of this cache key.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _load_qdrant_env(prefix: str = "") -> Dict[str, Any]:

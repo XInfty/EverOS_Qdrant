@@ -48,7 +48,7 @@ class AtomicFactQdrantRepository(BaseQdrantRepository[AtomicFactCollection]):
 
     async def create_and_save_atomic_fact(
         self,
-        id: str,
+        point_id: str,
         user_id: Optional[str],
         atomic_fact: str,
         parent_id: str,
@@ -72,7 +72,7 @@ class AtomicFactQdrantRepository(BaseQdrantRepository[AtomicFactCollection]):
         # is not falsy-rejected (any() on a list of 0.0s is False).
         if vector is None or len(vector) == 0:
             raise ValueError(
-                f"Vector is required for AtomicFact {id} but was not populated"
+                f"Vector is required for AtomicFact {point_id} but was not populated"
             )
 
         try:
@@ -94,15 +94,17 @@ class AtomicFactQdrantRepository(BaseQdrantRepository[AtomicFactCollection]):
             }
 
             await self.upsert(
-                qmodels.PointStruct(id=id, vector=vector, payload=payload)
+                qmodels.PointStruct(id=point_id, vector=vector, payload=payload)
             )
 
             logger.debug(
-                "Atomic fact point upserted: id=%s, user_id=%s", id, user_id
+                "Atomic fact point upserted: id=%s, user_id=%s", point_id, user_id
             )
 
+            # Result dict keeps the ``id`` key for caller parity with the
+            # Milvus counterpart; only the parameter name changed.
             return {
-                "id": id,
+                "id": point_id,
                 "user_id": user_id,
                 "atomic_fact": atomic_fact,
                 "parent_type": parent_type,
@@ -112,8 +114,8 @@ class AtomicFactQdrantRepository(BaseQdrantRepository[AtomicFactCollection]):
             }
 
         except Exception as e:
-            logger.error(
-                "Failed to create atomic fact point: id=%s, error=%s", id, e
+            logger.exception(
+                "Failed to create atomic fact point: id=%s, error=%s", point_id, e
             )
             raise
 

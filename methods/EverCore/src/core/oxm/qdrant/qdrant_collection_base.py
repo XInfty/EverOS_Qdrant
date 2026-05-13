@@ -25,6 +25,7 @@ DI-Container-Scan), aber ``QdrantLifespanProvider`` initialisiert nichts —
 ``ensure_all()`` und alle anderen Methoden werden gar nicht aufgerufen.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional
@@ -182,20 +183,23 @@ class QdrantCollectionBase:
 
     # ------------------------------------------------------------------ schema
 
-    def exists(self) -> bool:
+    async def exists(self) -> bool:
         """
         Return True if the underlying Qdrant collection already exists.
 
-        Only transport-level errors (``ResponseHandlingException`` — connect
-        refused, timeout, DNS failure) are caught and reported as "does not
-        exist". HTTP error responses (``UnexpectedResponse`` for 4xx/5xx,
-        including 401/403 auth failures and 5xx server errors) propagate —
-        treating them as "not exists" would route a downstream
-        ``ensure_collection()`` into a confusing follow-up create attempt
-        and bury the real cause (e.g. invalid API key, server down).
+        Async wrapper over the blocking ``qdrant_client.collection_exists``
+        call (offloaded to a worker thread). Only transport-level errors
+        (``ResponseHandlingException`` — connect refused, timeout, DNS
+        failure) are caught and reported as "does not exist". HTTP error
+        responses (``UnexpectedResponse`` for 4xx/5xx, including 401/403
+        auth failures and 5xx server errors) propagate — treating them as
+        "not exists" would route a downstream ``ensure_collection()`` into
+        a confusing follow-up create attempt and bury the real cause (e.g.
+        invalid API key, server down).
         """
+        client = self.client()
         try:
-            return self.client().collection_exists(self.name)
+            return await asyncio.to_thread(client.collection_exists, self.name)
         except ResponseHandlingException as e:
             logger.warning(
                 "collection_exists('%s') failed at transport level: %s — "
@@ -205,12 +209,15 @@ class QdrantCollectionBase:
             )
             return False
 
-    def count(self, exact: bool = True) -> int:
+    async def count(self, exact: bool = True) -> int:
         """Number of points in the collection."""
-        result = self.client().count(collection_name=self.name, exact=exact)
+        client = self.client()
+        result = await asyncio.to_thread(
+            client.count, collection_name=self.name, exact=exact
+        )
         return result.count
 
-    def ensure_collection(self) -> None:
+    async def ensure_collection(self) -> None:
         """
         Create the Qdrant collection if it does not exist.
 
@@ -227,14 +234,15 @@ class QdrantCollectionBase:
                 f"{self.__class__.__name__}._VECTOR_PARAMS is None"
             )
 
-        if self.exists():
+        client = self.client()
+        if await self.exists():
             # Validate dimension parity: a pre-existing collection with a
             # different vector size would only surface as opaque "vector
             # size mismatch" errors per upsert/search later. Fail loud here
             # instead so the operator notices a stale schema before data
             # corruption accumulates.
             try:
-                existing = self.client().get_collection(self.name)
+                existing = await asyncio.to_thread(client.get_collection, self.name)
                 existing_size = (
                     existing.config.params.vectors.size  # type: ignore[union-attr]
                 )
@@ -264,7 +272,8 @@ class QdrantCollectionBase:
             cfg.on_disk,
         )
         try:
-            self.client().create_collection(
+            await asyncio.to_thread(
+                client.create_collection,
                 collection_name=self.name,
                 vectors_config=cfg.to_vectors_config(),
             )
@@ -283,7 +292,7 @@ class QdrantCollectionBase:
             else:
                 raise
 
-    def ensure_payload_indexes(self) -> None:
+    async def ensure_payload_indexes(self) -> None:
         """
         Create payload-indexes for the fields declared in
         ``_VECTOR_PARAMS.payload_indexes``.
@@ -306,6 +315,7 @@ class QdrantCollectionBase:
             )
             return
 
+        client = self.client()
         for field_name, schema_str in cfg.payload_indexes.items():
             key = schema_str.strip().lower()
             if key not in _PAYLOAD_SCHEMA_TYPE_MAP:
@@ -315,7 +325,8 @@ class QdrantCollectionBase:
                 )
             schema_type = _PAYLOAD_SCHEMA_TYPE_MAP[key]
             try:
-                self.client().create_payload_index(
+                await asyncio.to_thread(
+                    client.create_payload_index,
                     collection_name=self.name,
                     field_name=field_name,
                     field_schema=schema_type,
@@ -327,7 +338,7 @@ class QdrantCollectionBase:
                     schema_str,
                 )
             except Exception as e:  # noqa: BLE001
-                logger.error(
+                logger.exception(
                     "Failed to ensure payload index on '%s.%s': %s",
                     self.name,
                     field_name,
@@ -335,28 +346,30 @@ class QdrantCollectionBase:
                 )
                 raise
 
-    def ensure_all(self) -> None:
+    async def ensure_all(self) -> None:
         """Idempotent one-shot init: collection + payload indexes."""
         logger.info("Initializing Qdrant collection '%s' [using=%s]", self.name, self.using)
-        self.ensure_collection()
-        self.ensure_payload_indexes()
+        await self.ensure_collection()
+        await self.ensure_payload_indexes()
         logger.info("Qdrant collection '%s' is ready", self.name)
 
     # ----------------------------------------------------------- data methods
 
-    def upsert(
+    async def upsert(
         self,
         points: List[qmodels.PointStruct],
         wait: bool = True,
     ) -> qmodels.UpdateResult:
         """Upsert points (insert or overwrite by id)."""
-        return self.client().upsert(
+        client = self.client()
+        return await asyncio.to_thread(
+            client.upsert,
             collection_name=self.name,
             points=points,
             wait=wait,
         )
 
-    def search(
+    async def search(
         self,
         query_vector: List[float],
         limit: int = 10,
@@ -375,31 +388,38 @@ class QdrantCollectionBase:
         and unwraps ``QueryResponse.points`` so the return type stays a
         ``List[ScoredPoint]``.
         """
-        response = self.client().query_points(
-            collection_name=self.name,
-            query=query_vector,
-            query_filter=query_filter,
-            limit=limit,
-            with_payload=with_payload,
-            with_vectors=with_vectors,
-            score_threshold=score_threshold,
-            **kwargs,
-        )
+        client = self.client()
+
+        def _call() -> Any:
+            return client.query_points(
+                collection_name=self.name,
+                query=query_vector,
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=with_payload,
+                with_vectors=with_vectors,
+                score_threshold=score_threshold,
+                **kwargs,
+            )
+
+        response = await asyncio.to_thread(_call)
         return response.points
 
-    def delete(
+    async def delete(
         self,
         point_ids: List[Any],
         wait: bool = True,
     ) -> qmodels.UpdateResult:
         """Delete by point ids."""
-        return self.client().delete(
+        client = self.client()
+        return await asyncio.to_thread(
+            client.delete,
             collection_name=self.name,
             points_selector=qmodels.PointIdsList(points=point_ids),
             wait=wait,
         )
 
-    def drop(self) -> None:
+    async def drop(self) -> None:
         """
         Drop the underlying Qdrant collection (DANGEROUS — irreversible).
 
@@ -407,8 +427,9 @@ class QdrantCollectionBase:
         caller can react. Use ``exists()`` beforehand to handle the
         already-absent case explicitly without relying on swallowed errors.
         """
+        client = self.client()
         try:
-            self.client().delete_collection(collection_name=self.name)
+            await asyncio.to_thread(client.delete_collection, collection_name=self.name)
             logger.info("Dropped Qdrant collection '%s'", self.name)
         except Exception as e:  # noqa: BLE001
             logger.warning(

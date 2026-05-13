@@ -14,7 +14,7 @@
 > ### Status
 >
 > - `main` — tracks upstream `EverMind-AI/EverOS`.
-> - `feature/qdrant-adapter` — work in progress. Phase 1: adapter skeleton.
+> - `qdrant/rebase-evercore` — full Milvus parity. Phase 1: ``QdrantCollectionBase`` + tenant-aware naming. Phase 2: 6 collections + 6 converters (EpisodicMemory, AtomicFact, Foresight, AgentCase, AgentSkill, UserProfile). Phase 2.5: 6 ``@repository``-decorated adapters with two-stage score gating and tz-aware epoch helpers. Phase 3: standalone re-embed CLI (Mongo → OpenRouter → Qdrant) + sweep wrapper across tenants.
 >
 > ### Approach
 >
@@ -107,24 +107,24 @@ Use cases show what persistent memory makes possible in real products and workfl
 <tr>
 <td width="50%" valign="top">
 
-![banner-gif](https://github.com/user-attachments/assets/650b901b-c9ba-4001-bac7-626b009df830)
+[![banner-gif](https://github.com/user-attachments/assets/650b901b-c9ba-4001-bac7-626b009df830)](#rokid-ai-assistant-with-everos)
 
 #### Rokid AI Assistant with EverOS
 
 Connect to EverOS within Rokid Glasses enabling long-term memory for all of your smart activities.
 
-Coming soon
+[Live Demo](#rokid-ai-assistant-with-everos)
 
 </td>
 <td width="50%" valign="top">
 
-![banner-gif](https://github.com/user-attachments/assets/85b338b2-e48e-4a65-9f30-0bc6998df872)
+[![banner-gif](https://github.com/user-attachments/assets/85b338b2-e48e-4a65-9f30-0bc6998df872)](#creative-assistant-with-memory)
 
 #### Creative Assistant with Memory
 
 Creative assistant with long-term memory, never forget your crativites anymore.
 
-Coming soon
+[Live Demo](#creative-assistant-with-memory)
 
 </td>
 </tr>

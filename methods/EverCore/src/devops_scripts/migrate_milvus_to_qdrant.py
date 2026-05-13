@@ -211,6 +211,7 @@ def build_payload(
     timestamp_unit: str,
     primary_text: str,
     extra_text_fields: Tuple[str, ...],
+    extra_timestamp_fields: Tuple[str, ...] = (),
 ) -> Dict[str, Any]:
     """Project mongo doc fields into a Qdrant payload dict."""
     payload: Dict[str, Any] = {}
@@ -226,26 +227,19 @@ def build_payload(
         if payload[timestamp_field] is None:
             payload.pop(timestamp_field, None)
 
-    # Some collections store a second time field in ``payload_fields`` (e.g.
-    # foresight's ``end_time``) that downstream code treats as epoch ms.
-    # Apply the same normalization to it so range filters / payload indexes
-    # don't see a mixed ``datetime`` / numeric / ISO-string population.
-    for field in payload_fields:
-        if field == timestamp_field:
-            continue  # already handled above
-        if field not in payload:
+    # Apply the same normalization to declared extra time fields (e.g.
+    # foresight's ``end_time``). The whitelist is required because a
+    # magnitude-based heuristic would also rewrite legitimate non-time
+    # numeric fields like ``maturity_score``, ``duration_days``, or
+    # ``memcell_count`` whenever they happened to exceed the threshold.
+    for field in extra_timestamp_fields:
+        if field == timestamp_field or field not in payload:
             continue
-        # Heuristic: only normalize fields that look time-shaped — a
-        # ``datetime`` or a numeric value. Strings (incl. ISO-8601) are
-        # passed through; if a collection needs ISO-string normalization,
-        # that's a per-collection concern, not a generic sweep concern.
-        value = payload[field]
-        if hasattr(value, "timestamp") or isinstance(value, (int, float)):
-            normalized = _normalize_timestamp_to_epoch(
-                value, timestamp_unit, doc.get("_id"), field,
-            )
-            if normalized is not None:
-                payload[field] = normalized
+        normalized = _normalize_timestamp_to_epoch(
+            payload[field], timestamp_unit, doc.get("_id"), field,
+        )
+        if normalized is not None:
+            payload[field] = normalized
 
     # Persist the text used for the embedding for downstream search-result
     # surfaces (matches the Milvus converter's ``search_content`` payload).
@@ -339,6 +333,7 @@ def migrate(
     limit: Optional[int],
     force: bool,
     dry_run: bool,
+    extra_timestamp_fields: Tuple[str, ...] = (),
 ) -> None:
     """Run the migration for one (mongo-db, mongo-collection) pair."""
     logger.info(
@@ -441,6 +436,7 @@ def migrate(
                 payload = build_payload(
                     d, payload_fields, timestamp_field, timestamp_unit,
                     text_field, extra_text_fields,
+                    extra_timestamp_fields=extra_timestamp_fields,
                 )
                 # Keep the original Mongo id in the payload so reverse-lookup
                 # from Qdrant -> Mongo is trivial.
@@ -546,6 +542,16 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Comma-separated list of fields to project from Mongo into the Qdrant payload",
     )
+    p.add_argument(
+        "--extra-timestamp-fields",
+        default="",
+        help=(
+            "Comma-separated payload field names that should ALSO be normalized "
+            "to epoch (in ``--timestamp-unit``). Use for collections that store "
+            "additional time fields beyond ``--timestamp-field`` "
+            "(e.g. foresight's ``end_time``)."
+        ),
+    )
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument(
         "--limit",
@@ -586,6 +592,9 @@ def main() -> int:
     payload_fields = tuple(
         f.strip() for f in args.payload_fields.split(",") if f.strip()
     )
+    extra_timestamp_fields = tuple(
+        f.strip() for f in args.extra_timestamp_fields.split(",") if f.strip()
+    )
     timestamp_field = args.timestamp_field.strip() or None
 
     migrate(
@@ -598,6 +607,7 @@ def main() -> int:
         timestamp_field=timestamp_field,
         timestamp_unit=args.timestamp_unit,
         payload_fields=payload_fields,
+        extra_timestamp_fields=extra_timestamp_fields,
         batch_size=args.batch_size,
         limit=args.limit,
         force=args.force,

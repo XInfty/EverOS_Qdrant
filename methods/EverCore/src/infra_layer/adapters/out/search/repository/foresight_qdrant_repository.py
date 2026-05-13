@@ -6,11 +6,17 @@ Mirrors the Milvus counterpart's surface (``create_and_save_foresight_mem``,
 ``vector_search``, ``delete_by_filters``) for caller parity.
 
 **Note on time filters:** the Foresight schema stores ``start_time`` and
-``end_time`` (both epoch milliseconds). The Milvus repository erroneously
-filters on a non-existent ``timestamp`` field; the Qdrant repository
-filters on ``start_time``/``end_time`` semantically — ``start_time`` arg
-maps to ``start_time >= ...`` and ``end_time`` arg to ``end_time <= ...``,
-which is the natural range-overlap semantic for a time-spanning record.
+``end_time`` (both epoch milliseconds). Both ``vector_search`` and
+``delete_by_filters`` use **window-overlap** semantics — a record matches
+when its window ``[start_time, end_time]`` overlaps the query window
+``[start_time arg, end_time arg]``:
+
+- ``end_time`` arg -> ``payload.start_time <= end_time_ms``
+- ``start_time`` arg -> ``payload.end_time >= start_time_ms``
+
+(Older revisions of this file used the inverted containment predicates,
+which silently dropped partially-overlapping records on read and left
+them undeleted on cleanup.)
 """
 
 import asyncio
@@ -316,17 +322,22 @@ class ForesightQdrantRepository(BaseQdrantRepository[ForesightCollection]):
                     )
                 )
 
+            # Use the same window-overlap semantics as ``vector_search``
+            # (record overlaps query window when record.end >= q.start AND
+            # record.start <= q.end). Diverging here would silently keep
+            # foresights that ``vector_search`` already returns, leaving
+            # callers with stale records after a "delete this window" call.
             if start_time:
                 conditions.append(
                     qmodels.FieldCondition(
-                        key="start_time",
+                        key="end_time",
                         range=qmodels.Range(gte=to_epoch_ms(start_time)),
                     )
                 )
             if end_time:
                 conditions.append(
                     qmodels.FieldCondition(
-                        key="end_time",
+                        key="start_time",
                         range=qmodels.Range(lte=to_epoch_ms(end_time)),
                     )
                 )
