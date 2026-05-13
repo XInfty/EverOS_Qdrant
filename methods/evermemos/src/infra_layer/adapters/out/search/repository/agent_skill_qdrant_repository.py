@@ -1,0 +1,234 @@
+"""
+AgentSkill Qdrant Repository.
+
+Provides vector search for agent skill records via Qdrant. Supports
+cluster-level delete for the replace pattern used by AgentSkillExtractor.
+
+Filter expressions are built as ``qmodels.Filter(must=[FieldCondition...])``
+instead of the Milvus string-expression syntax — same semantic, native
+typing.
+"""
+
+import asyncio
+from functools import partial
+from typing import Any, Dict, List, Optional
+
+from qdrant_client.http import models as qmodels
+
+from core.di.decorators import repository
+from core.observation.logger import get_logger
+from core.oxm.constants import MAGIC_ALL
+from core.oxm.qdrant.base_repository import BaseQdrantRepository
+from infra_layer.adapters.out.search.qdrant.memory.agent_skill_collection import (
+    AgentSkillCollection,
+)
+
+logger = get_logger(__name__)
+
+
+@repository("agent_skill_qdrant_repository", primary=False)
+class AgentSkillQdrantRepository(BaseQdrantRepository[AgentSkillCollection]):
+    """
+    AgentSkill Qdrant Repository.
+
+    Supports vector similarity search over reusable skill items, plus
+    cluster-level deletion for the replace pattern.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(AgentSkillCollection)
+
+    # ----------------------------------------------------------------- search
+
+    async def vector_search(
+        self,
+        query_vector: List[float],
+        group_ids: Optional[List[str]] = None,
+        user_id: Optional[str] = None,
+        cluster_id: Optional[str] = None,
+        limit: int = 10,
+        score_threshold: float = 0.0,
+        radius: Optional[float] = None,
+        maturity_threshold: Optional[float] = 0.6,
+        confidence_threshold: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Vector similarity search over agent skill items.
+
+        Args:
+            query_vector: Query embedding vector.
+            group_ids: Group ID list filter (``None`` to skip).
+            user_id: User ID filter. ``MAGIC_ALL`` disables the filter.
+            cluster_id: Filter by MemScene cluster ID.
+            limit: Max results to return.
+            score_threshold: Minimum Cosine similarity score (applied
+                post-search at the wrapper level; Qdrant also gets it via
+                ``score_threshold`` for early stopping).
+            radius: Explicit Cosine similarity threshold (>-1.0 enables it).
+            maturity_threshold: Minimum maturity score (0.0–1.0). ``None``
+                skips the filter (include all maturities).
+            confidence_threshold: Minimum confidence score (0.0–1.0). ``None``
+                skips the filter.
+
+        Returns:
+            List of result dicts with the same shape as the Milvus
+            repository for caller parity.
+        """
+        try:
+            conditions: List[qmodels.FieldCondition] = []
+
+            if maturity_threshold is not None:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="maturity_score",
+                        range=qmodels.Range(gte=maturity_threshold),
+                    )
+                )
+
+            if confidence_threshold is not None:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="confidence",
+                        range=qmodels.Range(gte=confidence_threshold),
+                    )
+                )
+
+            if user_id != MAGIC_ALL:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="user_id",
+                        match=qmodels.MatchValue(value=user_id or ""),
+                    )
+                )
+
+            if group_ids:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="group_id",
+                        match=qmodels.MatchAny(any=list(group_ids)),
+                    )
+                )
+
+            if cluster_id:
+                conditions.append(
+                    qmodels.FieldCondition(
+                        key="cluster_id",
+                        match=qmodels.MatchValue(value=cluster_id),
+                    )
+                )
+
+            query_filter = qmodels.Filter(must=conditions) if conditions else None
+
+            ef_value = max(128, limit * 2)
+            # Two-stage score gating (parity with Milvus repository):
+            #   - ``effective_threshold`` is the wider net we pass to Qdrant
+            #     server-side via ``score_threshold`` (uses ``radius`` if it
+            #     was explicitly set, otherwise ``score_threshold``).
+            #   - The client-side ``point.score < score_threshold`` post-filter
+            #     enforces the hard caller-facing minimum. This lets a caller
+            #     widen the recall via ``radius`` while still requiring a
+            #     stricter cut-off in the returned list.
+            effective_threshold = (
+                radius if (radius is not None and radius > -1.0) else score_threshold
+            )
+
+            scored_points = await self.search(
+                query_vector=query_vector,
+                limit=limit,
+                query_filter=query_filter,
+                with_payload=True,
+                with_vectors=False,
+                score_threshold=(
+                    effective_threshold if effective_threshold > 0 else None
+                ),
+                search_params=qmodels.SearchParams(hnsw_ef=ef_value),
+            )
+
+            search_results: List[Dict[str, Any]] = []
+            for point in scored_points:
+                if point.score < score_threshold:
+                    continue
+                payload = point.payload or {}
+                search_results.append(
+                    {
+                        "id": str(point.id),
+                        "score": float(point.score),
+                        "user_id": payload.get("user_id", ""),
+                        "group_id": payload.get("group_id"),
+                        "cluster_id": payload.get("cluster_id"),
+                        "content": payload.get("content", ""),
+                    }
+                )
+
+            logger.debug(
+                "AgentSkill Qdrant search: found %d results", len(search_results)
+            )
+            return search_results
+
+        except Exception as e:
+            logger.error("AgentSkill Qdrant search failed: %s", e)
+            raise
+
+    # -------------------------------------------------------- domain deletes
+
+    async def delete_by_cluster_id(self, cluster_id: str) -> int:
+        """
+        Delete all Qdrant points whose ``cluster_id`` payload matches.
+
+        Used by the AgentSkillExtractor's replace pattern: drop all skills
+        of a cluster, then re-upsert the freshly extracted skills.
+
+        Args:
+            cluster_id: MemScene cluster ID.
+
+        Returns:
+            Number of points deleted (best-effort; Qdrant doesn't return an
+            exact count, so we count via a prior scroll).
+        """
+        try:
+            filter_ = qmodels.Filter(
+                must=[
+                    qmodels.FieldCondition(
+                        key="cluster_id",
+                        match=qmodels.MatchValue(value=cluster_id),
+                    )
+                ]
+            )
+
+            client = self.collection.client()
+            name = self.collection.name
+
+            # Best-effort count via scroll (Qdrant ``delete(filter=)`` doesn't
+            # return the deleted-point count). Same idiom as the Milvus
+            # repository which queries first, then deletes.
+            scrolled, _ = await asyncio.to_thread(
+                partial(
+                    client.scroll,
+                    collection_name=name,
+                    scroll_filter=filter_,
+                    limit=10_000,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+            )
+            count = len(scrolled)
+
+            if count > 0:
+                await asyncio.to_thread(
+                    partial(
+                        client.delete,
+                        collection_name=name,
+                        points_selector=qmodels.FilterSelector(filter=filter_),
+                        wait=True,
+                    )
+                )
+                logger.debug(
+                    "Deleted %d Qdrant points for cluster=%s", count, cluster_id
+                )
+            return count
+
+        except Exception as e:
+            logger.error(
+                "Failed to delete Qdrant points for cluster=%s: %s", cluster_id, e
+            )
+            return 0
