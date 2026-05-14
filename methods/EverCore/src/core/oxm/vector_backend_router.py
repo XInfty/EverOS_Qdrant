@@ -27,22 +27,39 @@ pulling Qdrant client packages into Milvus-only deployments.
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Any, Type
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+_VALID_BACKENDS = {"qdrant", "milvus"}
 
 
 def _backend() -> str:
     """Return the active backend name in normalised form (``"qdrant"`` or
     ``"milvus"``). Mirrors the case-insensitive gate used by
-    ``QdrantLifespanProvider`` and ``MilvusLifespanProvider``."""
-    return os.getenv("VECTOR_STORE_BACKEND", "milvus").strip().lower()
+    ``QdrantLifespanProvider`` and ``MilvusLifespanProvider``. An
+    unrecognised value (e.g. a typo like ``VECTOR_STORE_BACKEND=qdarnt``)
+    falls back to ``"milvus"`` but emits a warning so the operator
+    notices instead of silently routing to the wrong backend.
+    """
+    raw = os.getenv("VECTOR_STORE_BACKEND", "milvus").strip().lower()
+    if raw not in _VALID_BACKENDS:
+        logger.warning(
+            "VECTOR_STORE_BACKEND=%r is not a known backend (expected one of "
+            "%s); falling back to 'milvus'",
+            raw, sorted(_VALID_BACKENDS),
+        )
+        return "milvus"
+    return raw
 
 
 def _is_qdrant() -> bool:
     return _backend() == "qdrant"
 
 
-def _resolve(qdrant_cls: Type[Any], milvus_cls: Type[Any]) -> Any:
+def _resolve(qdrant_cls: type[Any], milvus_cls: type[Any]) -> Any:
     """Resolve the right backend bean via the DI container so existing
     singleton scope (and any constructor wiring done by the DI scanner)
     is preserved. Falls back to direct instantiation only if no bean is

@@ -17,7 +17,7 @@ import asyncio
 import uuid
 from abc import ABC
 from datetime import datetime, timezone
-from typing import Any, Generic, List, Optional, Type, TypeVar
+from typing import Any, Dict, Generic, List, Optional, Type, TypeVar
 
 from qdrant_client.http import models as qmodels
 
@@ -154,6 +154,80 @@ class BaseQdrantRepository(ABC, Generic[T]):
 
     def get_model_name(self) -> str:
         return self.model_name
+
+    # ============================== Milvus-compat insert/insert_batch
+    # The service layer (memory_manager, mem_sync, mem_memorize,
+    # profile_indexer) was historically written against the Milvus
+    # repository surface: ``insert(entity_dict)`` and
+    # ``insert_batch(entity_dicts)`` taking the output of the
+    # corresponding ``*MilvusConverter.from_mongo()``. The Qdrant
+    # repositories had a different, type-safer surface
+    # (``create_and_save_*`` + native ``upsert(PointStruct)``).
+    #
+    # Rewriting every service-layer call would be a large, risky change.
+    # Instead, this base class provides a thin adapter: the Milvus dict
+    # is translated to a Qdrant ``PointStruct`` (vector lifted out, mongo
+    # ``_id`` mapped through ``mongo_id_to_qdrant_id``, all other fields
+    # become payload, raw mongo id preserved as ``mongo_id`` for round
+    # trip). ``flush`` is accepted and ignored — Qdrant durability is
+    # already covered by ``upsert(wait=True)``. With this in place, the
+    # ``vector_backend_router`` factory can hand a Qdrant repo to any
+    # caller that previously held a Milvus repo, and the existing
+    # converter+insert pipeline keeps working.
+
+    @staticmethod
+    def _milvus_entity_to_point(entity: Dict[str, Any]) -> Optional[qmodels.PointStruct]:
+        """Translate a Milvus-style entity dict into a ``PointStruct``.
+
+        Returns ``None`` when the entity has no vector to embed; callers
+        should silently skip those (the source converter is supposed to
+        guard, but the indexing pipeline sometimes gets called with
+        partially-built docs during early lifecycle).
+        """
+        vector = entity.get("vector")
+        if not vector:
+            return None
+        mongo_id = entity.get("id") or entity.get("mongo_id")
+        if mongo_id is None or mongo_id == "":
+            return None
+        payload: Dict[str, Any] = {
+            k: v for k, v in entity.items() if k != "vector"
+        }
+        payload["mongo_id"] = str(mongo_id)
+        return qmodels.PointStruct(
+            id=mongo_id_to_qdrant_id(mongo_id),
+            vector=vector,
+            payload=payload,
+        )
+
+    async def insert(self, entity: Dict[str, Any], flush: bool = False) -> str:
+        """Milvus-compat single-row insert. ``flush`` is accepted and ignored."""
+        point = self._milvus_entity_to_point(entity)
+        if point is None:
+            raise ValueError(
+                f"{self.model_name}: entity missing vector or id; cannot upsert"
+            )
+        await self.upsert(point)
+        return str(point.id)
+
+    async def insert_batch(
+        self, entities: List[Dict[str, Any]], flush: bool = False
+    ) -> qmodels.UpdateResult:
+        """Milvus-compat batch insert. Entities without vector/id are skipped."""
+        points: List[qmodels.PointStruct] = []
+        for entity in entities:
+            point = self._milvus_entity_to_point(entity)
+            if point is not None:
+                points.append(point)
+        if not points:
+            logger.debug(
+                "Qdrant insert_batch [%s]: 0 valid points after filtering",
+                self.model_name,
+            )
+            return qmodels.UpdateResult(
+                operation_id=0, status=qmodels.UpdateStatus.COMPLETED
+            )
+        return await self.upsert_batch(points)
 
     # =================================================== Basic CRUD (async)
 
