@@ -660,9 +660,13 @@ async def _trigger_agent_skill_extraction(
         remove_ids = extraction_result.deleted_ids + updated_ids
 
         if upsert_records or remove_ids:
-            # Milvus sync: delete stale entries -> insert new/updated
+            # Vector-store sync: delete stale entries -> insert new/updated.
+            # Backend (Qdrant or Milvus) is routed by VECTOR_STORE_BACKEND
+            # via vector_backend_router; variable kept named
+            # ``agent_skill_milvus_repo`` for local-clarity only.
             try:
-                agent_skill_milvus_repo = get_bean_by_type(AgentSkillMilvusRepository)
+                from core.oxm.vector_backend_router import get_agent_skill_repo
+                agent_skill_milvus_repo = get_agent_skill_repo()
                 for old_id in remove_ids:
                     await agent_skill_milvus_repo.delete_by_id(old_id)
                 inserted_count = 0

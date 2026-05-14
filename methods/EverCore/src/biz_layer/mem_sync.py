@@ -62,12 +62,15 @@ class MemorySyncService:
             foresight_es_repo: Foresight ES repository instance (optional, obtained from DI if not provided)
             atomic_fact_es_repo: Atomic fact ES repository instance (optional, obtained from DI if not provided)
         """
-        self.foresight_milvus_repo = foresight_milvus_repo or get_bean_by_type(
-            ForesightMilvusRepository
+        # Field names keep the ``_milvus_`` token for caller-compat, but
+        # the actual instance is routed by VECTOR_STORE_BACKEND via the
+        # vector_backend_router factory.
+        from core.oxm.vector_backend_router import (
+            get_atomic_fact_repo,
+            get_foresight_repo,
         )
-        self.atomic_fact_milvus_repo = atomic_fact_milvus_repo or get_bean_by_type(
-            AtomicFactMilvusRepository
-        )
+        self.foresight_milvus_repo = foresight_milvus_repo or get_foresight_repo()
+        self.atomic_fact_milvus_repo = atomic_fact_milvus_repo or get_atomic_fact_repo()
         self.foresight_es_repo = foresight_es_repo or get_bean_by_type(
             ForesightEsRepository
         )

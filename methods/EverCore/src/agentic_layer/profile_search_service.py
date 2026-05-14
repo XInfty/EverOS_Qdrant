@@ -97,9 +97,15 @@ class ProfileSearchService:
     
     @property
     def milvus_repo(self) -> UserProfileMilvusRepository:
-        """Lazy load Milvus repository"""
+        """Lazy load the vector repository for the active backend.
+
+        Named ``milvus_repo`` for caller-compatibility; the actual instance
+        is routed by ``VECTOR_STORE_BACKEND`` via
+        ``core.oxm.vector_backend_router.get_user_profile_repo()``.
+        """
         if self._milvus_repo is None:
-            self._milvus_repo = get_bean_by_type(UserProfileMilvusRepository)
+            from core.oxm.vector_backend_router import get_user_profile_repo
+            self._milvus_repo = get_user_profile_repo()
         return self._milvus_repo
     
     async def search_profiles(
