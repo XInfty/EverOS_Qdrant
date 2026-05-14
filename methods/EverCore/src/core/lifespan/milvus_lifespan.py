@@ -48,7 +48,7 @@ class MilvusLifespanProvider(LifespanProvider):
         # Milvus and crashes the service when Milvus is offline (e.g. after
         # cutover or during outage), preventing the Qdrant adapter — which
         # runs at order=19, AFTER milvus order=18 — from ever starting.
-        if os.getenv("VECTOR_STORE_BACKEND", "milvus") == "qdrant":
+        if os.getenv("VECTOR_STORE_BACKEND", "milvus").strip().lower() == "qdrant":
             logger.info(
                 "VECTOR_STORE_BACKEND=qdrant — Milvus lifespan startup no-op"
             )
