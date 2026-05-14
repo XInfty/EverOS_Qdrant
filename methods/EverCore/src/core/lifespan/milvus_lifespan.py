@@ -2,6 +2,7 @@
 Milvus lifespan provider implementation
 """
 
+import os
 from collections import defaultdict
 from fastapi import FastAPI
 from typing import Any
@@ -41,6 +42,18 @@ class MilvusLifespanProvider(LifespanProvider):
         Returns:
             Any: Milvus client information
         """
+        # Symmetric env-gate (mirrors QdrantLifespanProvider): when running with
+        # the Qdrant adapter as the active vector backend, the Milvus lifespan
+        # must be a no-op. Without this gate it always tries to connect to
+        # Milvus and crashes the service when Milvus is offline (e.g. after
+        # cutover or during outage), preventing the Qdrant adapter — which
+        # runs at order=19, AFTER milvus order=18 — from ever starting.
+        if os.getenv("VECTOR_STORE_BACKEND", "milvus") == "qdrant":
+            logger.info(
+                "VECTOR_STORE_BACKEND=qdrant — Milvus lifespan startup no-op"
+            )
+            return None
+
         logger.info("Initializing Milvus connection...")
 
         try:
