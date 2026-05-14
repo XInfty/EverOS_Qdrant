@@ -141,15 +141,24 @@ class SearchMemoryService:
         # ES Repositories
         self.episodic_es_repo = EpisodicMemoryEsRepository()
 
-        # Milvus Repositories
-        self.episodic_milvus_repo = EpisodicMemoryMilvusRepository()
-        self.profile_milvus_repo = UserProfileMilvusRepository()
+        # Vector Repositories — routed by VECTOR_STORE_BACKEND env at
+        # construction time. Field names keep the historical ``_milvus_``
+        # token for caller compatibility, but the actual backend is the
+        # one configured for this process (Qdrant or Milvus).
+        from core.oxm.vector_backend_router import (
+            get_agent_case_repo,
+            get_agent_skill_repo,
+            get_episodic_repo,
+            get_user_profile_repo,
+        )
+        self.episodic_milvus_repo = get_episodic_repo()
+        self.profile_milvus_repo = get_user_profile_repo()
 
         # Agent memory repositories
         self.agent_case_es_repo = AgentCaseEsRepository()
         self.agent_skill_es_repo = AgentSkillEsRepository()
-        self.agent_case_milvus_repo = AgentCaseMilvusRepository()
-        self.agent_skill_milvus_repo = AgentSkillMilvusRepository()
+        self.agent_case_milvus_repo = get_agent_case_repo()
+        self.agent_skill_milvus_repo = get_agent_skill_repo()
 
         # MongoDB raw repositories (for fetching full docs by id)
         self.episodic_raw_repo = EpisodicMemoryRawRepository()

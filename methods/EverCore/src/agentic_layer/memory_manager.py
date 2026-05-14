@@ -671,18 +671,27 @@ class MemoryManager:
                 f"Query text vectorization completed, vector dimension: {len(query_vector_list)}"
             )
 
-            # Select Milvus repository based on memory type
+            # Select vector repository based on memory type. Routed by
+            # VECTOR_STORE_BACKEND env via vector_backend_router; the local
+            # variable keeps the ``milvus_repo`` name only for legacy clarity.
+            from core.oxm.vector_backend_router import (
+                get_agent_case_repo,
+                get_agent_skill_repo,
+                get_atomic_fact_repo,
+                get_episodic_repo,
+                get_foresight_repo,
+            )
             match mem_type:
                 case MemoryType.FORESIGHT:
-                    milvus_repo = get_bean_by_type(ForesightMilvusRepository)
+                    milvus_repo = get_foresight_repo()
                 case MemoryType.ATOMIC_FACT:
-                    milvus_repo = get_bean_by_type(AtomicFactMilvusRepository)
+                    milvus_repo = get_atomic_fact_repo()
                 case MemoryType.EPISODIC_MEMORY:
-                    milvus_repo = get_bean_by_type(EpisodicMemoryMilvusRepository)
+                    milvus_repo = get_episodic_repo()
                 case MemoryType.AGENT_CASE:
-                    milvus_repo = get_bean_by_type(AgentCaseMilvusRepository)
+                    milvus_repo = get_agent_case_repo()
                 case MemoryType.AGENT_SKILL:
-                    milvus_repo = get_bean_by_type(AgentSkillMilvusRepository)
+                    milvus_repo = get_agent_skill_repo()
                 case _:
                     raise ValueError(f"Unsupported memory type: {mem_type}")
 
