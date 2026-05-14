@@ -40,9 +40,22 @@ class BaseMilvusRepository(ABC, Generic[T]):
         """
         self.model = model
         self.model_name = model.__name__
-        self.collection: Optional[AsyncCollection] = model.async_collection()
+        # Lazy collection resolution: the underlying Milvus collection is only
+        # available once `MilvusLifespanProvider` has run `ensure_loaded()`.
+        # When VECTOR_STORE_BACKEND=qdrant the Milvus lifespan is a no-op, so
+        # eager resolution here would crash the entire app startup at every
+        # repository `__init__`. We defer to first access of `self.collection`
+        # so the app boots and qdrant-mode never touches the Milvus pathway.
+        self._collection_cache: Optional[AsyncCollection] = None
         self.schema = model._SCHEMA
         self.all_output_fields = [field.name for field in self.schema.fields]
+
+    @property
+    def collection(self) -> AsyncCollection:
+        """Lazy accessor for the underlying async Milvus collection."""
+        if self._collection_cache is None:
+            self._collection_cache = self.model.async_collection()
+        return self._collection_cache
 
     # ==================== Basic CRUD Operations ====================
 

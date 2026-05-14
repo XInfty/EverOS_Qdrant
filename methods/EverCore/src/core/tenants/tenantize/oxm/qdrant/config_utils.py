@@ -35,7 +35,7 @@ def get_tenant_qdrant_config() -> Optional[Dict[str, Any]]:
         oder ``None`` falls kein Tenant aktiv.
     """
     # Lazy import vermeidet Circular-Dependency bei Adapter-Discovery-Time.
-    from core.tenants.tenantize.tenant_context import get_current_tenant
+    from core.tenants.tenant_contextvar import get_current_tenant
 
     # Fail-closed: an unexpected error during tenant resolution must not
     # degrade silently to the shared base-prefix path — that would route a
