@@ -12,7 +12,7 @@ instead of Milvus' string expression syntax.
 
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import partial
 from typing import Any, Dict, List, Optional
 

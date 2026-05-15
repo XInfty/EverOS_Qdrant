@@ -30,6 +30,7 @@ from agentic_layer.rerank_interface import (
 )
 from agentic_layer.rerank_vllm import VllmRerankService, VllmRerankConfig
 from agentic_layer.rerank_deepinfra import DeepInfraRerankService, DeepInfraRerankConfig
+from agentic_layer.rerank_voyage import VoyageRerankService, VoyageRerankConfig
 from agentic_layer.metrics.rerank_metrics import (
     record_rerank_request,
     record_rerank_fallback,
@@ -173,6 +174,17 @@ def _create_service_from_config(
             max_concurrent_requests=max_concurrent,
         )
         return DeepInfraRerankService(config)
+    elif provider.lower() == "voyage":
+        config = VoyageRerankConfig(
+            api_key=api_key,
+            base_url=base_url or 'https://api.voyageai.com/v1/rerank',
+            model=model,
+            timeout=timeout,
+            max_retries=max_retries,
+            batch_size=batch_size,
+            max_concurrent_requests=max_concurrent,
+        )
+        return VoyageRerankService(config)
     else:
         raise RerankError(f"Unsupported provider: {provider}")
 
