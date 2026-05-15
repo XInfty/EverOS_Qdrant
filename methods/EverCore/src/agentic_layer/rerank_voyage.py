@@ -55,12 +55,19 @@ class VoyageRerankService(RerankServiceInterface):
         self.config = config
         self.session: Optional[aiohttp.ClientSession] = None
         self._semaphore = asyncio.Semaphore(config.max_concurrent_requests)
+        self._session_lock = asyncio.Lock()
         logger.info(
             f"Initialized VoyageRerankService | url={config.base_url} | model={config.model}"
         )
 
     async def _ensure_session(self):
-        if self.session is None or self.session.closed:
+        # Lock guards against concurrent first-touch creating multiple sessions
+        # and leaking the loser; the inner re-check covers the racy second waiter.
+        if self.session is not None and not self.session.closed:
+            return
+        async with self._session_lock:
+            if self.session is not None and not self.session.closed:
+                return
             timeout = aiohttp.ClientTimeout(total=self.config.timeout)
             self.session = aiohttp.ClientSession(
                 timeout=timeout,
