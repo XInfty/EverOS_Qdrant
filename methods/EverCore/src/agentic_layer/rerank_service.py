@@ -175,10 +175,19 @@ def _create_service_from_config(
         )
         return DeepInfraRerankService(config)
     elif provider.lower() == "voyage":
+        # Codex P1 / CodeRabbit major: the shared RERANK_MODEL default in
+        # env.template is "Qwen/Qwen3-Reranker-4B", which Voyage rejects.
+        # When the model is unset or still on the non-Voyage default, fall
+        # back to VoyageRerankConfig's provider-specific default ("rerank-2.5").
+        voyage_default_model = VoyageRerankConfig.__dataclass_fields__["model"].default
+        non_voyage_defaults = {"", None, "Qwen/Qwen3-Reranker-4B"}
+        resolved_model = (
+            model if model not in non_voyage_defaults else voyage_default_model
+        )
         config = VoyageRerankConfig(
             api_key=api_key,
-            base_url=base_url or 'https://api.voyageai.com/v1/rerank',
-            model=model,
+            base_url=base_url or "https://api.voyageai.com/v1/rerank",
+            model=resolved_model,
             timeout=timeout,
             max_retries=max_retries,
             batch_size=batch_size,
