@@ -155,10 +155,14 @@ class VoyageRerankService(RerankServiceInterface):
         if not documents:
             return {"results": []}
 
-        # Codex R2 P2: validate batch_size before slicing so a misconfigured
-        # negative/zero RERANK_BATCH_SIZE fails loudly instead of silently
-        # producing zero batches.
-        batch_size = self.config.batch_size or 100
+        # Codex R2 P2 + CodeRabbit PR8 follow-up: validate batch_size before
+        # slicing so a misconfigured negative/zero RERANK_BATCH_SIZE fails
+        # loudly instead of silently producing zero batches. The previous
+        # `or 100` short-circuit silently corrected batch_size=0 to 100,
+        # masking the fail-fast contract this code is meant to enforce.
+        batch_size = self.config.batch_size
+        if batch_size is None:
+            batch_size = 100
         if batch_size <= 0:
             raise RerankError(
                 f"Invalid Voyage batch_size={batch_size}; must be > 0"
