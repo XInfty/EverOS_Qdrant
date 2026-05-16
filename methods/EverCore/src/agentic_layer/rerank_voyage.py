@@ -144,30 +144,64 @@ class VoyageRerankService(RerankServiceInterface):
     async def rerank_documents(
         self, query: str, documents: List[str], instruction: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Low-level reranking; ``instruction`` is ignored — Voyage uses the
-        query/documents pair directly."""
+        """Low-level reranking.
+
+        Voyage's `/v1/rerank` endpoint accepts only `query` + `documents`; it
+        has no separate ``instruction`` field. To preserve the call-site
+        contract (search_mem_service passes skill-specific instructions), the
+        instruction is prepended to the query when provided, matching the
+        behaviour of vLLM/DeepInfra implementations.
+        """
         if not documents:
             return {"results": []}
 
+        # Codex R2 P2: validate batch_size before slicing so a misconfigured
+        # negative/zero RERANK_BATCH_SIZE fails loudly instead of silently
+        # producing zero batches.
         batch_size = self.config.batch_size or 100
+        if batch_size <= 0:
+            raise RerankError(
+                f"Invalid Voyage batch_size={batch_size}; must be > 0"
+            )
+
+        # Codex R2 P2: honour instruction (was silently dropped, breaking
+        # skill-biased reranking in search_mem_service).
+        effective_query = (
+            f"{instruction}\n{query}" if instruction else query
+        )
+
         batches = [
             documents[i : i + batch_size] for i in range(0, len(documents), batch_size)
         ]
 
         batch_tasks = [
-            self._send_rerank_request_batch(query, batch) for batch in batches
+            self._send_rerank_request_batch(effective_query, batch) for batch in batches
         ]
         batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        # Codex R2 P1: fail-fast on batch errors. The previous implementation
+        # extended scores with synthetic -100.0 sentinels and continued, which
+        # silently degraded ordering when Voyage was unreachable. With
+        # RERANK_FALLBACK_PROVIDER=none in production this re-introduced the
+        # exact silent-fail pattern that took 3 days to detect in the
+        # original Qdrant-migration bug. Raise so the rerank_service factory
+        # / HybridRerankService can route to a configured fallback or
+        # propagate the outage to the caller.
+        failures = [
+            (i, r) for i, r in enumerate(batch_results) if isinstance(r, Exception)
+        ]
+        if failures:
+            first_i, first_err = failures[0]
+            raise RerankError(
+                f"Voyage rerank failed for {len(failures)}/{len(batches)} batches; "
+                f"first failure: batch {first_i}: {first_err}"
+            )
 
         all_scores: List[float] = []
         total_input_tokens = 0
         last_response = None
 
-        for i, result in enumerate(batch_results):
-            if isinstance(result, Exception):
-                logger.error(f"Voyage rerank batch {i} failed: {result}")
-                all_scores.extend([-100.0] * len(batches[i]))
-                continue
+        for result in batch_results:
             all_scores.extend(result.get("scores", []))
             total_input_tokens += result.get("input_tokens", 0)
             last_response = result
@@ -221,8 +255,12 @@ class VoyageRerankService(RerankServiceInterface):
             return []
 
         try:
+            # CodeRabbit security: avoid logging raw query (multi-tenant data
+            # leakage risk). Log only metadata.
             logger.debug(
-                f"Voyage reranking, query: {query!r}, num_texts={len(all_texts)}"
+                "Voyage reranking: query_len=%d, num_texts=%d",
+                len(query),
+                len(all_texts),
             )
             rerank_result = await self.rerank_documents(query, all_texts, instruction)
             if "results" not in rerank_result:
